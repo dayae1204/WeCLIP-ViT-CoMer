@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Dataset files
+VOCtrainval_11-May-2012.tar
+VOCdevkit/
+
+# Logs
+wget-log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo 
