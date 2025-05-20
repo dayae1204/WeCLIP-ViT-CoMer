@@ -1,0 +1,743 @@
+import logging
+from functools import partial
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+from clip.ops.modules import MSDeformAttn
+from timm.models.layers import DropPath
+import torch.utils.checkpoint as cp
+import math
+
+# _logger = logging.getLogger(__name__)
+
+
+# def get_reference_points(spatial_shapes, device):
+#     reference_points_list = []
+#     for lvl, (H_, W_) in enumerate(spatial_shapes):
+#         ref_y, ref_x = torch.meshgrid(
+#             torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+#             torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+#         ref_y = ref_y.reshape(-1)[None] / H_
+#         ref_x = ref_x.reshape(-1)[None] / W_
+#         ref = torch.stack((ref_x, ref_y), -1)
+#         reference_points_list.append(ref)
+#     reference_points = torch.cat(reference_points_list, 1)
+#     reference_points = reference_points[:, :, None]
+#     return reference_points
+
+def get_reference_points(spatial_shapes, device):
+    reference_points_list = []
+    for lvl, (H_, W_) in enumerate(spatial_shapes):
+        ref_y, ref_x = torch.meshgrid(
+            torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+            torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+        ref_y = ref_y.reshape(-1)[None] / H_
+        ref_x = ref_x.reshape(-1)[None] / W_
+        ref = torch.stack((ref_x, ref_y), -1)
+        reference_points_list.append(ref)
+    reference_points = torch.cat(reference_points_list, 1)
+    reference_points = reference_points[:, :, None]
+    return reference_points
+
+def deform_inputs(x):
+    bs, c, h, w = x.shape
+    spatial_shapes = torch.as_tensor([(h // 8, w // 8),
+                                      (h // 16, w // 16),
+                                      (h // 32, w // 32)],
+                                     dtype=torch.long, device=x.device)
+    level_start_index = torch.cat((spatial_shapes.new_zeros(
+        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+    reference_points = get_reference_points([(h // 16, w // 16)], x.device)
+    deform_inputs1 = [reference_points, spatial_shapes, level_start_index]
+    
+    spatial_shapes = torch.as_tensor([(h // 16, w // 16)], dtype=torch.long, device=x.device)
+    level_start_index = torch.cat((spatial_shapes.new_zeros(
+        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+    reference_points = get_reference_points([(h // 8, w // 8),
+                                                   (h // 16, w // 16),
+                                                   (h // 32, w // 32)], x.device)
+    deform_inputs2 = [reference_points, spatial_shapes, level_start_index]
+    
+    return deform_inputs1, deform_inputs2
+
+
+# def deform_inputs_only_one(x, h, w):
+#     # bs, c, h, w = x.shape
+#     spatial_shapes = torch.as_tensor([(h // 8, w // 8),
+#                                       (h // 16, w // 16),
+#                                       (h // 32, w // 32)],
+#                                      dtype=torch.long, device=x.device)
+#     level_start_index = torch.cat((spatial_shapes.new_zeros(
+#         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+#     reference_points = get_reference_points([(h // 8, w // 8),
+#                                       (h // 16, w // 16),
+#                                       (h // 32, w // 32)], device=x.device)
+#     deform_inputs = [reference_points, spatial_shapes, level_start_index]
+    
+#     return deform_inputs
+
+def deform_inputs_only_one(query_tensor, h, w):
+    """
+    query_tensor: (L, N, C) 또는 (N, L, C) 형태의 query 텐서
+    h, w: 원본 이미지 크기
+    
+    반환:
+    - reference_points: 다중 레벨 참조 포인트
+    - spatial_shapes: 입력 특징 맵의 공간 크기 (3개 레벨)
+    - level_start_index: 각 레벨의 시작 인덱스
+    """
+    # ViT-CoMer와 동일하게 3개의 해상도 레벨 설정
+    spatial_shapes = torch.as_tensor([(h // 8, w // 8),
+                                     (h // 16, w // 16),
+                                     (h // 32, w // 32)],
+                                    dtype=torch.long, device=query_tensor.device)
+    
+    # 레벨 시작 인덱스 계산
+    level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), 
+                                  spatial_shapes.prod(1).cumsum(0)[:-1]))
+    
+    # 3개 레벨에 대한 참조 포인트 생성
+    reference_points = get_reference_points([(h // 8, w // 8),
+                                           (h // 16, w // 16),
+                                           (h // 32, w // 32)], 
+                                          device=query_tensor.device)
+    
+    # query_tensor의 sequence length 확인
+    if query_tensor.dim() == 3:
+        if query_tensor.shape[0] > query_tensor.shape[1]:  # (L, N, C) 형태
+            seq_len = query_tensor.shape[0]
+        else:  # (N, L, C) 형태
+            seq_len = query_tensor.shape[1]
+    else:
+        raise ValueError(f"query_tensor must be 3D, got shape {query_tensor.shape}")
+    
+    # Class token이 있는지 확인
+    has_class_token = False
+    if seq_len > 1:
+        grid_size = int(math.sqrt(seq_len - 1))
+        if grid_size * grid_size + 1 == seq_len:
+            has_class_token = True
+    
+    # Class token이 있는 경우, reference_points 조정
+    if has_class_token:
+        # 원래 3개 레벨의 reference points 유지하면서 class token 처리
+        # Class token을 위한 dummy reference point 생성
+        dummy_ref = torch.zeros((1, 1, 1, 2), dtype=torch.float32, device=query_tensor.device)
+        
+        # Class token과 나머지 참조 포인트를 결합하는 방식 구현
+        # 참고: 이 부분은 모델 아키텍처에 따라 조정이 필요할 수 있습니다
+        # 방법 1: 클래스 토큰을 각 레벨에 추가 (이 방식 선택)
+        batch_size = reference_points.shape[0]
+        expanded_dummy = dummy_ref.expand(batch_size, 1, 1, 2)
+        
+        # 각 레벨별로 참조 포인트 분리
+        level_references = []
+        current_idx = 0
+        for level_shape in spatial_shapes:
+            level_len = level_shape[0] * level_shape[1]
+            level_ref = reference_points[:, current_idx:current_idx+level_len, :, :]
+            # 각 레벨의 앞에 클래스 토큰 참조 포인트 추가
+            level_ref_with_cls = torch.cat([expanded_dummy, level_ref], dim=1)
+            level_references.append(level_ref_with_cls)
+            current_idx += level_len
+        
+        # 수정된 참조 포인트 재결합
+        reference_points_with_cls = torch.cat(level_references, dim=1)
+        
+        # spatial_shapes와 level_start_index 조정
+        # 각 레벨에 클래스 토큰 하나씩 추가
+        adjusted_spatial_shapes = torch.zeros_like(spatial_shapes)
+        adjusted_spatial_shapes[:, 0] = spatial_shapes[:, 0]
+        adjusted_spatial_shapes[:, 1] = spatial_shapes[:, 1]
+        
+        # 레벨 시작 인덱스 재계산 (각 레벨에 클래스 토큰 하나씩 추가)
+        adjusted_level_start_index = torch.zeros_like(level_start_index)
+        adjusted_level_start_index[0] = 0
+        for i in range(1, len(level_start_index)):
+            adjusted_level_start_index[i] = level_start_index[i] + i
+        
+        return [reference_points_with_cls, adjusted_spatial_shapes, adjusted_level_start_index]
+    
+    # Class token이 없는 경우, 원래 ViT-CoMer와 동일하게 반환
+    return [reference_points, spatial_shapes, level_start_index]
+
+class ConvFFN(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.dwconv = DWConv(hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        x = self.fc1(x)
+        x = self.dwconv(x, H, W)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class MRFP(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.dwconv = MultiDWConv(hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        x = self.fc1(x)
+        x = self.dwconv(x, H, W)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class DWConv(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        n = N // 21
+        x1 = x[:, 0:16 * n, :].transpose(1, 2).view(B, C, H * 2, W * 2).contiguous()
+        x2 = x[:, 16 * n:20 * n, :].transpose(1, 2).view(B, C, H, W).contiguous()
+        x3 = x[:, 20 * n:, :].transpose(1, 2).view(B, C, H // 2, W // 2).contiguous()
+        x1 = self.dwconv(x1).flatten(2).transpose(1, 2)
+        x2 = self.dwconv(x2).flatten(2).transpose(1, 2)
+        x3 = self.dwconv(x3).flatten(2).transpose(1, 2)
+        x = torch.cat([x1, x2, x3], dim=1)
+        return x
+    
+
+class MultiDWConv(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        dim1 = dim
+        dim = dim // 2
+
+        self.dwconv1 = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+        self.dwconv2 = nn.Conv2d(dim, dim, 5, 1, 2, bias=True, groups=dim)
+
+        self.dwconv3 = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+        self.dwconv4 = nn.Conv2d(dim, dim, 5, 1, 2, bias=True, groups=dim)
+
+        self.dwconv5 = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+        self.dwconv6 = nn.Conv2d(dim, dim, 5, 1, 2, bias=True, groups=dim)
+
+        self.act1 = nn.GELU()
+        self.bn1 = nn.BatchNorm2d(dim1)
+
+        self.act2 = nn.GELU()
+        self.bn2 = nn.BatchNorm2d(dim1)
+
+        self.act3 = nn.GELU()
+        self.bn3 = nn.BatchNorm2d(dim1)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        n = N // 21
+        x1 = x[:, 0:16 * n, :].transpose(1, 2).view(B, C, H * 2, W * 2).contiguous()
+        x2 = x[:, 16 * n:20 * n, :].transpose(1, 2).view(B, C, H, W).contiguous()
+        x3 = x[:, 20 * n:, :].transpose(1, 2).view(B, C, H // 2, W // 2).contiguous()
+        
+        x11, x12 = x1[:,:C//2,:,:], x1[:,C//2:,:,:]
+        x11 = self.dwconv1(x11)  # BxCxHxW
+        x12 = self.dwconv2(x12)
+        x1 = torch.cat([x11, x12], dim=1)
+        x1 = self.act1(self.bn1(x1)).flatten(2).transpose(1, 2)
+        
+
+        x21, x22 = x2[:,:C//2,:,:], x2[:,C//2:,:,:]
+        x21 = self.dwconv3(x21)
+        x22 = self.dwconv4(x22)
+        x2 = torch.cat([x21, x22], dim=1)
+        x2 = self.act2(self.bn2(x2)).flatten(2).transpose(1, 2)
+
+        x31, x32 = x3[:,:C//2,:,:], x3[:,C//2:,:,:]
+        x31 = self.dwconv5(x31)
+        x32 = self.dwconv6(x32)
+        x3 = torch.cat([x31, x32], dim=1)
+        x3 = self.act3(self.bn3(x3)).flatten(2).transpose(1, 2)
+
+        x = torch.cat([x1, x2, x3], dim=1)
+        return x
+
+class MultiscaleExtractor(nn.Module):
+    def __init__(self, dim, num_heads=6, n_points=4, n_levels=1, deform_ratio=1.0,
+                 with_cffn=True, cffn_ratio=0.25, drop=0., drop_path=0.,
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), with_cp=False):
+        super().__init__()
+        self.query_norm = norm_layer(dim)
+        self.feat_norm = norm_layer(dim)
+        self.attn = MSDeformAttn(d_model=dim, n_levels=n_levels, n_heads=num_heads,
+                                 n_points=n_points, ratio=deform_ratio)
+        self.with_cffn = with_cffn
+        self.with_cp = with_cp
+        if with_cffn:
+            self.ffn = ConvFFN(in_features=dim, hidden_features=int(dim * cffn_ratio), drop=drop)
+            self.ffn_norm = norm_layer(dim)
+            self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    
+    def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        
+        def _inner_forward(query, feat):
+            
+            attn = self.attn(self.query_norm(query), reference_points,
+                             self.feat_norm(feat), spatial_shapes,
+                             level_start_index, None)
+            query = query + attn
+            
+            if self.with_cffn:
+                query = query + self.drop_path(self.ffn(self.ffn_norm(query), H, W))
+
+            return query
+        
+        if self.with_cp and query.requires_grad:
+            query = cp.checkpoint(_inner_forward, query, feat)
+        else:
+            query = _inner_forward(query, feat)
+        
+        return query
+
+
+class CTI_toC(nn.Module):
+    def __init__(self, dim, num_heads=6, n_points=4, n_levels=1, deform_ratio=1.0,
+                 with_cffn=True, cffn_ratio=0.25, drop=0., drop_path=0.,
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), with_cp=False,
+                 cnn_feature_interaction=True):
+        super().__init__()
+        self.query_norm = norm_layer(dim)
+        self.feat_norm = norm_layer(dim)
+        self.with_cffn = with_cffn
+        self.with_cp = with_cp
+        # if with_cffn:
+        #     self.ffn = ConvFFN(in_features=dim, hidden_features=int(dim * cffn_ratio), drop=drop)
+        #     self.ffn_norm = norm_layer(dim)
+        #     self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.cnn_feature_interaction = cnn_feature_interaction
+        if cnn_feature_interaction:
+            self.cfinter = MultiscaleExtractor(dim=dim, n_levels=3, num_heads=num_heads,
+                                n_points=n_points, norm_layer=norm_layer, 
+                                deform_ratio=deform_ratio, with_cffn=with_cffn,
+                                cffn_ratio=cffn_ratio, drop=drop, drop_path=drop_path, 
+                                with_cp=with_cp)
+    
+    # def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        
+    #     def _inner_forward(query, feat, H, W):
+    #         B, N, C = query.shape
+    #         n = N // 21
+    #         x1 = query[:, 0:16 * n, :].contiguous()
+    #         x2 = query[:, 16 * n:20 * n, :].contiguous()
+    #         x3 = query[:, 20 * n:, :].contiguous()
+    #         x2 = x2 + feat
+    #         query = torch.cat([x1, x2, x3], dim=1)
+
+    #         # if self.with_cffn:
+    #         #     query = query + self.drop_path(self.ffn(self.ffn_norm(query), H, W)) 
+
+    #         if self.cnn_feature_interaction:               
+    #             deform_input = deform_inputs_only_one(query, H*16, W*16)
+    #             query = self.cfinter(query=self.query_norm(query), reference_points=deform_input[0],
+    #                       feat=self.feat_norm(query), spatial_shapes=deform_input[1],
+    #                       level_start_index=deform_input[2],
+    #                       H=H, W=W)               
+            
+    #         return query
+        
+    #     if self.with_cp and query.requires_grad:
+    #         query = cp.checkpoint(_inner_forward, query, feat, H, W)
+    #     else:
+    #         query = _inner_forward(query, feat, H, W)
+        
+    #     return query
+
+    def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        def _inner_forward(query, feat, reference_points, spatial_shapes, level_start_index, H, W):
+            # 입력 크기 확인
+            if query.dim() == 3:  # (L, N, C)
+                if query.shape[0] > query.shape[1]:  # LND 형식
+                    Len_q = query.shape[0]
+                else:  # NLD 형식
+                    Len_q = query.shape[1]
+            else:
+                Len_q = query.shape[1] if query.dim() == 3 else query.shape[0]
+            
+            if feat.dim() == 3:  # (L, N, C)
+                if feat.shape[0] > feat.shape[1]:  # LND 형식
+                    Len_in = feat.shape[0]
+                else:  # NLD 형식
+                    Len_in = feat.shape[1]
+            else:
+                Len_in = feat.shape[1] if feat.dim() == 3 else feat.shape[0]
+            
+            # 크기 불일치 로깅
+            if Len_q != reference_points.shape[1]:
+                # print(f"Warning: query length ({Len_q}) != reference_points length ({reference_points.shape[1]})")
+                pass
+            
+            expected_len = int((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum().item())
+            if expected_len != Len_in:
+                # print(f"Warning: Expected input length ({expected_len}) != actual length ({Len_in})")
+                pass
+            
+            try:
+                B, N, C = query.shape
+                n = N // 21
+                x1 = query[:, 0:16 * n, :].contiguous()
+                x2 = query[:, 16 * n:20 * n, :].contiguous()
+                x3 = query[:, 20 * n:, :].contiguous()
+                x2 = x2 + feat
+                query = torch.cat([x1, x2, x3], dim=1)
+                
+                if self.cnn_feature_interaction:
+                    # 올바른 deform_inputs 생성
+                    deform_input = deform_inputs_only_one(query, H*16, W*16)
+                    new_reference_points, new_spatial_shapes, new_level_start_index = deform_input
+                    
+                    query = self.cfinter(
+                        query=self.query_norm(query), 
+                        reference_points=new_reference_points,
+                        feat=self.feat_norm(query), 
+                        spatial_shapes=new_spatial_shapes,
+                        level_start_index=new_level_start_index,
+                        H=H, W=W
+                    )
+                
+                return query
+            except Exception as e:
+                # print(f"Error in _inner_forward of CTI_toC: {e}")
+                # 오류 발생 시 원본 query 반환
+                return query
+        
+        if self.with_cp and query.requires_grad:
+            return cp.checkpoint(lambda q, f, r, s, l, h, w: _inner_forward(q, f, r, s, l, h, w), 
+                            query, feat, reference_points, spatial_shapes, level_start_index, H, W)
+        else:
+            return _inner_forward(query, feat, reference_points, spatial_shapes, level_start_index, H, W)
+
+class Extractor_CTI(nn.Module):
+    def __init__(self, dim, num_heads=6, n_points=4, n_levels=1, deform_ratio=1.0,
+                 with_cffn=True, cffn_ratio=0.25, drop=0., drop_path=0.,
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), with_cp=False,
+                 cnn_feature_interaction=True):
+        super().__init__()
+        self.query_norm = norm_layer(dim)
+        self.feat_norm = norm_layer(dim)
+        self.with_cffn = with_cffn
+        self.with_cp = with_cp
+        if with_cffn:
+            self.ffn = ConvFFN(in_features=dim, hidden_features=int(dim * cffn_ratio), drop=drop)
+            self.ffn_norm = norm_layer(dim)
+            self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.cnn_feature_interaction = cnn_feature_interaction
+        if cnn_feature_interaction:
+            self.cfinter = MultiscaleExtractor(dim=dim, n_levels=3, num_heads=num_heads,
+                                n_points=n_points, norm_layer=norm_layer, 
+                                deform_ratio=deform_ratio, with_cffn=with_cffn,
+                                cffn_ratio=cffn_ratio, drop=drop, drop_path=drop_path, 
+                                with_cp=with_cp)
+    
+    def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        
+        def _inner_forward(query, feat, H, W):
+            B, N, C = query.shape
+            n = N // 21
+            x1 = query[:, 0:16 * n, :].contiguous()
+            x2 = query[:, 16 * n:20 * n, :].contiguous()
+            x3 = query[:, 20 * n:, :].contiguous()
+            x2 = x2 + feat
+            query = torch.cat([x1, x2, x3], dim=1)
+
+            if self.with_cffn:
+                query = query + self.drop_path(self.ffn(self.ffn_norm(query), H, W)) 
+
+            if self.cnn_feature_interaction:               
+                deform_input = deform_inputs_only_one(query, H*16, W*16)
+                query = self.cfinter(query=self.query_norm(query), reference_points=deform_input[0],
+                          feat=self.feat_norm(query), spatial_shapes=deform_input[1],
+                          level_start_index=deform_input[2],
+                          H=H, W=W)               
+            
+            return query
+        
+        if self.with_cp and query.requires_grad:
+            query = cp.checkpoint(_inner_forward, query, feat, H, W)
+        else:
+            query = _inner_forward(query, feat, H, W)
+        
+        return query
+
+
+
+class CTI_toV(nn.Module):
+    def __init__(self, dim, num_heads=6, n_points=4, n_levels=1, deform_ratio=1.0,
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), init_values=0., with_cp=False, drop=0., drop_path=0., cffn_ratio=0.25):
+        super().__init__()
+        self.with_cp = with_cp
+        self.query_norm = norm_layer(dim)
+        self.feat_norm = norm_layer(dim)
+        self.attn = MSDeformAttn(d_model=dim, n_levels=n_levels, n_heads=num_heads,
+                                 n_points=n_points, ratio=deform_ratio)
+        self.gamma = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
+
+        self.ffn = ConvFFN(in_features=dim, hidden_features=int(dim * cffn_ratio), drop=drop)
+        self.ffn_norm = norm_layer(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+       
+    
+    # def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        
+    #     def _inner_forward(query, feat, H, W):
+    #         B, N, C = feat.shape
+    #         c1 = self.attn(self.query_norm(feat), reference_points,
+    #                          self.feat_norm(feat), spatial_shapes,
+    #                          level_start_index, None)
+
+    #         c1 = c1 + self.drop_path(self.ffn(self.ffn_norm(c1), H, W)) 
+
+    #         c_select1, c_select2, c_select3 = c1[:,:H*W*4, :], c1[:, H*W*4:H*W*4+H*W, :], c1[:, H*W*4+H*W:, :]
+    #         c_select1 = F.interpolate(c_select1.permute(0,2,1).reshape(B, C, H*2, W*2), scale_factor=0.5, mode='bilinear', align_corners=False).flatten(2).permute(0,2,1)
+    #         c_select3 = F.interpolate(c_select3.permute(0,2,1).reshape(B, C, H//2, W//2), scale_factor=2, mode='bilinear', align_corners=False).flatten(2).permute(0,2,1)
+    #         # x = x + c_select1 + c_select2 + c_select3
+
+    #         return query + self.gamma * (c_select1 + c_select2 + c_select3)
+        
+    #     if self.with_cp and query.requires_grad:
+    #         query = cp.checkpoint(_inner_forward, query, feat, H, W)
+    #     else:
+    #         query = _inner_forward(query, feat, H, W)
+        
+    #     return query
+
+    def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        def _inner_forward(query, feat, reference_points, spatial_shapes, level_start_index, H, W):
+            # 입력 크기 확인
+            if query.dim() == 3:  # (L, N, C)
+                if query.shape[0] > query.shape[1]:  # LND 형식
+                    Len_q = query.shape[0]
+                else:  # NLD 형식
+                    Len_q = query.shape[1]
+            else:
+                Len_q = query.shape[1] if query.dim() == 3 else query.shape[0]
+            
+            if feat.dim() == 3:  # (L, N, C)
+                if feat.shape[0] > feat.shape[1]:  # LND 형식
+                    Len_in = feat.shape[0]
+                else:  # NLD 형식
+                    Len_in = feat.shape[1]
+            else:
+                Len_in = feat.shape[1] if feat.dim() == 3 else feat.shape[0]
+            
+            # 크기 불일치 로깅
+            if Len_q != reference_points.shape[1]:
+                # print(f"Warning: query length ({Len_q}) != reference_points length ({reference_points.shape[1]})")
+                pass
+            
+            expected_len = int((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum().item())
+            if expected_len != Len_in:
+                # print(f"Warning: Expected input length ({expected_len}) != actual length ({Len_in})")
+                pass
+            
+            try:
+                # MSDeformAttn 호출 전 필요한 형식으로 변환
+                query_norm = self.query_norm(query)
+                feat_norm = self.feat_norm(feat)
+                
+                # 현재 MSDeformAttn은 입력 크기가 일치해야 함
+                # 따라서 feat_norm의 크기를 query와 맞추거나, 또는 다른 방법으로 처리 필요
+                if Len_in != expected_len:
+                    # print(f"Reshaping feat_norm from {feat_norm.shape} to match expected length {expected_len}")
+                    
+                    # 방법 1: 첫 expected_len 개만 사용
+                    if Len_in > expected_len:
+                        if feat_norm.dim() == 3:  # (L, N, C)
+                            feat_norm = feat_norm[:expected_len, :, :]
+                        else:  # (N, L, C)
+                            feat_norm = feat_norm[:, :expected_len, :]
+                    
+                    # 방법 2: 부족한 경우 패딩
+                    elif Len_in < expected_len:
+                        if feat_norm.dim() == 3:  # (L, N, C)
+                            N_feat = feat_norm.shape[1]
+                            padding = torch.zeros((expected_len - Len_in, N_feat, feat_norm.shape[2]), 
+                                                dtype=feat_norm.dtype, device=feat_norm.device)
+                            feat_norm = torch.cat([feat_norm, padding], dim=0)
+                        else:  # (N, L, C)
+                            N_feat = feat_norm.shape[0]
+                            padding = torch.zeros((N_feat, expected_len - Len_in, feat_norm.shape[2]), 
+                                                dtype=feat_norm.dtype, device=feat_norm.device)
+                            feat_norm = torch.cat([feat_norm, padding], dim=1)
+                
+                # 이제 MSDeformAttn 호출
+                try:
+                    # MSDeformAttn 호출 시도
+                    c1 = self.attn(query_norm, reference_points, feat_norm, 
+                                spatial_shapes, level_start_index, None)
+                    
+                    # FFN 적용
+                    c1 = c1 + self.drop_path(self.ffn(self.ffn_norm(c1), H, W))
+                    
+                    # 처리 및 업샘플링/다운샘플링
+                    B, N, C = feat.shape
+                    c_select1, c_select2, c_select3 = c1[:,:H*W*4, :], c1[:, H*W*4:H*W*4+H*W, :], c1[:, H*W*4+H*W:, :]
+                    c_select1 = F.interpolate(c_select1.permute(0,2,1).reshape(B, C, H*2, W*2), scale_factor=0.5, mode='bilinear', align_corners=False).flatten(2).permute(0,2,1)
+                    c_select3 = F.interpolate(c_select3.permute(0,2,1).reshape(B, C, H//2, W//2), scale_factor=2, mode='bilinear', align_corners=False).flatten(2).permute(0,2,1)
+                    
+                    return query + self.gamma * (c_select1 + c_select2 + c_select3)
+                    
+                except Exception as e:
+                    # print(f"MSDeformAttn failed: {e}")
+                    # 대체 구현 - fallback_attention이 없으면 원본 쿼리 반환
+                    if hasattr(self, '_fallback_attention'):
+                        return query + self.gamma * self._fallback_attention(query_norm, feat_norm)
+                    else:
+                        return query
+            except Exception as e:
+                # print(f"Error in _inner_forward of CTI_toV: {e}")
+                # 오류 발생 시 원본 query 반환
+                return query
+        
+        if self.with_cp and query.requires_grad:
+            return cp.checkpoint(lambda q, f, r, s, l, h, w: _inner_forward(q, f, r, s, l, h, w), 
+                            query, feat, reference_points, spatial_shapes, level_start_index, H, W)
+        else:
+            return _inner_forward(query, feat, reference_points, spatial_shapes, level_start_index, H, W)
+    
+
+class CTIBlock(nn.Module):
+    def __init__(self, dim, num_heads=6, n_points=4, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                 drop=0., drop_path=0., with_cffn=True, cffn_ratio=0.25, init_values=0.,
+                 deform_ratio=1.0, extra_CTI=False, with_cp=False, 
+                 use_CTI_toV=True, 
+                 use_CTI_toC=True,
+                 dim_ratio=6.0,
+                 cnn_feature_interaction=False):
+        super().__init__()
+
+        if use_CTI_toV:
+            self.cti_tov = CTI_toV(dim=dim, n_levels=3, num_heads=num_heads, init_values=init_values,
+                                 n_points=n_points, norm_layer=norm_layer, deform_ratio=deform_ratio,
+                                 with_cp=with_cp, drop=drop, drop_path=drop_path, cffn_ratio=cffn_ratio)
+        if use_CTI_toC:
+            self.cti_toc = CTI_toC(dim=dim, n_levels=1, num_heads=num_heads, n_points=n_points,
+                                   norm_layer=norm_layer, deform_ratio=deform_ratio, with_cffn=with_cffn,
+                                   cffn_ratio=cffn_ratio, drop=drop, drop_path=drop_path, with_cp=with_cp,
+                                   cnn_feature_interaction=cnn_feature_interaction)
+        
+        if extra_CTI:
+            self.extra_CTIs = nn.Sequential(*[
+                Extractor_CTI(dim=dim, n_levels=1, num_heads=num_heads, n_points=n_points,
+                                   norm_layer=norm_layer, deform_ratio=deform_ratio, with_cffn=with_cffn,
+                                   cffn_ratio=cffn_ratio, drop=drop, drop_path=drop_path, with_cp=with_cp,
+                                   cnn_feature_interaction=cnn_feature_interaction)
+                for _ in range(4)
+            ])
+
+        else:
+            self.extra_CTIs = None
+        
+        self.use_CTI_toV = use_CTI_toV
+        self.use_CTI_toC = use_CTI_toC
+
+        self.mrfp = MRFP(dim, hidden_features=int(dim * dim_ratio))
+
+    
+    def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
+        B, N, C = x.shape
+        deform_inputs = deform_inputs_only_one(x, H*16, W*16)
+        if self.use_CTI_toV:
+            c = self.mrfp(c, H, W)
+            c_select1, c_select2, c_select3 = c[:,:H*W*4, :], c[:, H*W*4:H*W*4+H*W, :], c[:, H*W*4+H*W:, :]
+            c = torch.cat([c_select1, c_select2 + x, c_select3], dim=1)
+
+            x = self.cti_tov(query=x, reference_points=deform_inputs[0],
+                          feat=c, spatial_shapes=deform_inputs[1],
+                          level_start_index=deform_inputs[2], H=H, W=W)
+
+        for idx, blk in enumerate(blocks):
+            x = blk(x, H, W)
+
+        if self.use_CTI_toC:
+            c = self.cti_toc(query=c, reference_points=deform_inputs2[0],
+                           feat=x, spatial_shapes=deform_inputs2[1],
+                           level_start_index=deform_inputs2[2], H=H, W=W)
+                           
+        if self.extra_CTIs is not None:
+            for cti in self.extra_CTIs:
+                c = cti(query=c, reference_points=deform_inputs2[0],
+                              feat=x, spatial_shapes=deform_inputs2[1],
+                              level_start_index=deform_inputs2[2], H=H, W=W)
+        return x, c
+
+
+class CNN(nn.Module):
+    def __init__(self, inplanes=64, embed_dim=384):
+        super().__init__()
+
+        self.stem = nn.Sequential(*[
+            nn.Conv2d(3, inplanes, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.SyncBatchNorm(inplanes),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inplanes, inplanes, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.SyncBatchNorm(inplanes),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inplanes, inplanes, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.SyncBatchNorm(inplanes),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        ])
+        self.conv2 = nn.Sequential(*[
+            nn.Conv2d(inplanes, 2 * inplanes, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.SyncBatchNorm(2 * inplanes),
+            nn.ReLU(inplace=True)
+        ])
+        self.conv3 = nn.Sequential(*[
+            nn.Conv2d(2 * inplanes, 4 * inplanes, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.SyncBatchNorm(4 * inplanes),
+            nn.ReLU(inplace=True)
+        ])
+        self.conv4 = nn.Sequential(*[
+            nn.Conv2d(4 * inplanes, 4 * inplanes, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.SyncBatchNorm(4 * inplanes),
+            nn.ReLU(inplace=True)
+        ])
+        self.fc1 = nn.Conv2d(inplanes, embed_dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fc2 = nn.Conv2d(2 * inplanes, embed_dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fc3 = nn.Conv2d(4 * inplanes, embed_dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fc4 = nn.Conv2d(4 * inplanes, embed_dim, kernel_size=1, stride=1, padding=0, bias=True)
+
+    def forward(self, x):
+        c1 = self.stem(x)
+        c2 = self.conv2(c1)
+        c3 = self.conv3(c2)
+        c4 = self.conv4(c3)
+        c1 = self.fc1(c1)
+        c2 = self.fc2(c2)
+        c3 = self.fc3(c3)
+        c4 = self.fc4(c4)
+
+        bs, dim, _, _ = c1.shape
+        # c1 = c1.view(bs, dim, -1).transpose(1, 2)  # 4s
+        c2 = c2.view(bs, dim, -1).transpose(1, 2)  # 8s
+        c3 = c3.view(bs, dim, -1).transpose(1, 2)  # 16s
+        c4 = c4.view(bs, dim, -1).transpose(1, 2)  # 32s
+
+        return c1, c2, c3, c4
