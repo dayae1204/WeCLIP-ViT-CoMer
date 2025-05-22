@@ -29,7 +29,6 @@ parser.add_argument("--model_path", default="/your/path/WeCLIP/WeCLIP_model_iter
                     type=str, help="model_path")
 
 
-
 def validate(model, dataset, test_scales=None):
 
     _preds, _gts, _msc_preds, cams = [], [], [], []
@@ -56,13 +55,22 @@ def validate(model, dataset, test_scales=None):
         labels = labels.cuda()
 
         #######
-        # resize long side to 512
-        
+        # resize long side to args.resize_long (e.g., 512)
         _, _, h, w = inputs.shape
-        ratio = args.resize_long / max(h,w)
+        ratio = args.resize_long / max(h, w)
         _h, _w = int(h*ratio), int(w*ratio)
-        inputs = F.interpolate(inputs, size=(_h, _w), mode='bilinear', align_corners=False)
         
+        # 새로운 코드: _h, _w를 32의 배수로 조정
+        # 32의 배수 중 가장 가까운 값으로 내림
+        _h = (_h // 32) * 32
+        _w = (_w // 32) * 32
+        
+        # 최소 크기 보장 (32보다 작아지는 경우 방지)
+        _h = max(_h, 32)
+        _w = max(_w, 32)
+        
+        # 조정된 크기로 리사이즈
+        inputs = F.interpolate(inputs, size=(_h, _w), mode='bilinear', align_corners=False)
         #######
 
         segs_list = []
@@ -76,9 +84,22 @@ def validate(model, dataset, test_scales=None):
 
         _, _, h, w = segs_cat.shape
 
+        # 멀티스케일 테스트를 유지하면서 각 스케일에서도 32의 배수로 조정
         for s in test_scales:
             if s != 1.0:
-                _inputs = F.interpolate(inputs, scale_factor=s, mode='bilinear', align_corners=False)
+                # 스케일 조정 후 크기 계산
+                scaled_h, scaled_w = int(_h * s), int(_w * s)
+                
+                # 32의 배수로 조정
+                scaled_h = (scaled_h // 32) * 32
+                scaled_w = (scaled_w // 32) * 32
+                
+                # 최소 크기 보장
+                scaled_h = max(scaled_h, 32)
+                scaled_w = max(scaled_w, 32)
+                
+                # 조정된 크기로 입력 리사이즈
+                _inputs = F.interpolate(inputs, size=(scaled_h, scaled_w), mode='bilinear', align_corners=False)
                 inputs_cat = torch.cat([_inputs, _inputs.flip(-1)], dim=0)
 
                 segs_cat, cam_cat, attn_loss = model(inputs_cat, names, mode='val')
@@ -119,7 +140,6 @@ def validate(model, dataset, test_scales=None):
         # np.save(args.work_dir+ '/logit/' + name[0] + '.npy', {"segs":segs.detach().cpu().numpy(), "msc_segs":msc_segs.detach().cpu().numpy()})
             
     return _gts, _preds, _msc_preds, cams, _preds_hist, _msc_preds_hist, _cams_hist
-
 
 def crf_proc(config):
     print("crf post-processing...")
