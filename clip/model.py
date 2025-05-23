@@ -483,6 +483,11 @@ class VisionTransformer(nn.Module):
         # 8개의 CTI 출력을 channel-wise concat 후 적용할 1x1 convolution
         self.final_conv = nn.Conv2d(width * 8, width, kernel_size=1)
 
+        # MRFP 결과를 CNN feature에 통합하기 위한 learnable weights
+        self.mrfp_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
+        ])
+
         # # Add this after initializing CTI modules
         # for module in self.cti_to_v_modules:
         #     module._fallback_attention = types.MethodType(_fallback_attention, module)
@@ -582,7 +587,9 @@ class VisionTransformer(nn.Module):
         # attention weight를 저장할 리스트와 transformer feature map을 저장할 리스트 추가
         attn_weights = []
         transformer_features = []
-    
+
+        # MRFP outputs를 저장할 리스트 추가
+        mrfp_outputs = []    
 
         # 각 stage 별로 처리
         for stage_idx, (start_block, end_block) in enumerate(self.stage_indices):
@@ -591,7 +598,12 @@ class VisionTransformer(nn.Module):
             
             # 제거: Stage 시작 전 adapter 적용 (ViT feature에)
             # adapter_v_output = self.adapters_to_v[stage_idx](current_vit)
+
+            mrfp_outputs.append(processed_cnn)
             
+            # MRFP 결과를 current_cnn에 통합 (learnable weight 사용)
+            current_cnn = current_cnn + self.mrfp_weights[stage_idx] * processed_cnn
+
             # CTI_toV 적용 (CNN -> ViT)
             try:
                 deform_input = deform_inputs_only_one(current_vit, H*16, W*16)
@@ -820,7 +832,7 @@ class VisionTransformer(nn.Module):
             last_vit_output = current_vit
             
             # transformer features(feature maps), attention weights(NLL 형태), CTI outputs 반환
-            return last_vit_output, transformer_features, cti_outputs, [f1, f2, f3, f4], final_cti, attn_weights
+            return last_vit_output, transformer_features, cti_outputs, [f1, f2, f3, f4], final_cti, attn_weights, mrfp_outputs
 
         else:
             # 기존 VisionTransformer의 출력 형태 유지

@@ -165,7 +165,7 @@ class WeCLIP(nn.Module):
         self.iter_num += 1
 
         # ViT-Comer 모델 실행 - 8개의 CTI 출력을 포함한 결과 받기
-        last_vit_output, transformer_features, cti_outputs, multi_level_features, final_cti, attn_weight_list = self.encoder.visual(
+        last_vit_output, transformer_features, cti_outputs, multi_level_features, final_cti, attn_weight_list, mrfp_outputs = self.encoder.visual(
             img, h, w, require_all_fts=True)
         
         # attention weight 처리
