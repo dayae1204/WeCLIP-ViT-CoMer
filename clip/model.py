@@ -446,9 +446,9 @@ class VisionTransformer(nn.Module):
         ])
         
         # Adapter 모듈 추가 (각 CTI에 대응)
-        # self.adapters_to_v = nn.ModuleList([
-        #     Adapter(width) for _ in range(len(self.stage_indices))
-        # ])
+        self.adapters_to_v = nn.ModuleList([
+            Adapter(width) for _ in range(len(self.stage_indices))
+        ])
 
         self.adapters_to_c = nn.ModuleList([
             Adapter(width) for _ in range(len(self.stage_indices))
