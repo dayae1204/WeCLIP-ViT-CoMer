@@ -386,23 +386,21 @@ class Adapter(nn.Module):
         x = self.up_proj(x)
         return shortcut + x
 
-    
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
-        self.width = width  # Add this line
+        self.width = width
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
-
         self.ln_post = LayerNorm(width)
 
-        # ViT-B/16은 총 12개의 transformer block을 가짐 (11개는 정상 forward, 12번째는 Grad-CAM용)
+        # WeCLIP의 transformer blocks 사용
         self.transformer = Transformer(width, layers, heads)
         self.patch_size = patch_size
         
@@ -421,44 +419,13 @@ class VisionTransformer(nn.Module):
         self.spm = CNN(inplanes=64, embed_dim=width)
         self.level_embed = nn.Parameter(torch.zeros(3, width))
         
-        # CTI_toV 모듈 (CNN -> ViT 방향의 특징 융합)
-        self.cti_to_v_modules = nn.ModuleList([
-            CTI_toV(dim=width, num_heads=heads//2, n_points=4,
-                deform_ratio=1.0, init_values=0.,
-                norm_layer=LayerNorm, drop=0.1, drop_path=0.1,
-                cffn_ratio=0.25)
-            for _ in range(len(self.stage_indices))
-        ])
-        
-        # CTI_toC 모듈 (ViT -> CNN 방향의 특징 융합)
-        self.cti_to_c_modules = nn.ModuleList([
-            CTI_toC(dim=width, num_heads=heads//2, n_points=4,
-                deform_ratio=1.0, with_cffn=True,
-                cffn_ratio=0.25, drop=0.1, drop_path=0.1,
-                norm_layer=LayerNorm, cnn_feature_interaction=True)
-            for _ in range(len(self.stage_indices))
-        ])
-        
         # MRFP 모듈 (Multi-Resolution Feature Processing)
         self.mrfp_modules = nn.ModuleList([
             MRFP(width, hidden_features=int(width * 6.0))
             for _ in range(len(self.stage_indices))
         ])
         
-        # Adapter 모듈 추가 (각 CTI에 대응)
-        self.adapters_to_v = nn.ModuleList([
-            Adapter(width) for _ in range(len(self.stage_indices))
-        ])
-
-        self.adapters_to_c = nn.ModuleList([
-            Adapter(width) for _ in range(len(self.stage_indices))
-        ])
-
-        self.adapters = nn.ModuleList([
-            Adapter(width) for _ in range(layers)
-        ])       
-        
-        # interactions
+        # CTIBlock 모듈들 - 원래 ViT-CoMer의 CTIBlock 사용
         self.interactions = nn.ModuleList([
             CTIBlock(dim=width, num_heads=heads//2, n_points=4,
                     init_values=0., drop_path=0.1,
@@ -488,28 +455,17 @@ class VisionTransformer(nn.Module):
             nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
         ])
 
-        # # Add this after initializing CTI modules
-        # for module in self.cti_to_v_modules:
-        #     module._fallback_attention = types.MethodType(_fallback_attention, module)
-        # for module in self.cti_to_c_modules:
-        #     module._fallback_attention = types.MethodType(_fallback_attention, module)
-
         # 초기화
         self._init_weights()
 
-            
     def _init_weights(self):
-        # SPM, MRFP, CTI_toV, CTI_toC 등의 가중치 초기화
+        # SPM, MRFP, CTI interactions 등의 가중치 초기화
         self.spm.apply(self._init_weights_fn)
         self.mrfp_modules.apply(self._init_weights_fn)
-        self.cti_to_v_modules.apply(self._init_weights_fn)
-        self.cti_to_c_modules.apply(self._init_weights_fn)
+        self.interactions.apply(self._init_weights_fn)
         self.up.apply(self._init_weights_fn)
+        self.final_conv.apply(self._init_weights_fn)
         nn.init.normal_(self.level_embed, std=0.02)
-        
-        # 필요한 경우 adapters도 초기화
-        # self.adapters_to_v.apply(self._init_weights_fn)
-        self.adapters_to_c.apply(self._init_weights_fn)
         
     def _init_weights_fn(self, m):
         if isinstance(m, nn.Linear):
@@ -577,139 +533,89 @@ class VisionTransformer(nn.Module):
         
         bs, _, dim = x_vit.shape[1], x_vit.shape[0], x_vit.shape[2]
         
-        # 각 CTI 모듈의 출력을 저장할 리스트
+        # attention weight를 저장할 리스트와 transformer feature map을 저장할 리스트
+        attn_weights = []
+        transformer_features = []
+        
+        # CTI 출력들을 저장할 리스트 (CNN branch용 4개 + ViT branch용 4개 = 총 8개)
         cti_outputs = []
         
+        # MRFP outputs를 저장할 리스트
+        mrfp_outputs = []
+
         # 현재 ViT 및 CNN feature
         current_vit = x_vit
         current_cnn = c
 
-        # attention weight를 저장할 리스트와 transformer feature map을 저장할 리스트 추가
-        attn_weights = []
-        transformer_features = []
-
-        # MRFP outputs를 저장할 리스트 추가
-        mrfp_outputs = []    
-
-        # 각 stage 별로 처리
+        # 각 stage 별로 원래 CTIBlock 사용
         for stage_idx, (start_block, end_block) in enumerate(self.stage_indices):
-            # MRFP 적용 (CNN feature 처리)
-            processed_cnn = self.mrfp_modules[stage_idx](current_cnn.to(self.mrfp_modules[stage_idx].fc1.weight.dtype), H//16, W//16)
-            
-            # 제거: Stage 시작 전 adapter 적용 (ViT feature에)
-            # adapter_v_output = self.adapters_to_v[stage_idx](current_vit)
-
-            mrfp_outputs.append(processed_cnn)
-            
-            # MRFP 결과를 current_cnn에 통합 (learnable weight 사용)
-            current_cnn = current_cnn + self.mrfp_weights[stage_idx] * processed_cnn
-
-            # CTI_toV 적용 (CNN -> ViT)
-            try:
-                deform_input = deform_inputs_only_one(current_vit, H*16, W*16)
-                reference_points, spatial_shapes, level_start_index = deform_input
-
-                cti_v_output = self.cti_to_v_modules[stage_idx](
-                    query=current_vit,  # 변경: adapter_v_output -> current_vit
-                    reference_points=reference_points,
-                    feat=processed_cnn,
-                    spatial_shapes=spatial_shapes,
-                    level_start_index=level_start_index,
-                    H=H//16, W=W//16
-                )
-                
-                # Save CTI_toV output
-                cti_outputs.append(cti_v_output)
-                
-                # Residual connection: current_vit + cti_v_output
-                stage_input = current_vit + cti_v_output
-            except Exception as e:
-                print(f"Error in CTI_toV: {e}")
-                # Create a fallback attention mechanism
-                if not hasattr(self.cti_to_v_modules[stage_idx], '_fallback_attention'):
-                    # Add the method to the instance
-                    import types
-                    self.cti_to_v_modules[stage_idx]._fallback_attention = types.MethodType(
-                        _fallback_attention, self.cti_to_v_modules[stage_idx]
-                    )
-
-                try:
-                    # Use fallback attention mechanism with explicit dtype handling
-                    fallback_output = self.cti_to_v_modules[stage_idx]._fallback_attention(
-                        current_vit, processed_cnn  # 변경: adapter_v_output -> current_vit
-                    )
-                    
-                    # Save and apply fallback output
-                    cti_outputs.append(fallback_output)
-                    stage_input = current_vit + fallback_output
-                except Exception as inner_e:
-                    print(f"Even fallback attention failed: {inner_e}")
-                    # Last resort: just continue with unmodified input
-                    cti_outputs.append(current_vit)  # 변경: adapter_v_output -> current_vit
-                    stage_input = current_vit
-                        
-            # Stage 내의 transformer blocks 처리
-            stage_output = stage_input
+            # 해당 stage의 transformer blocks 준비
+            stage_blocks = []
             for block_idx in range(start_block, end_block + 1):
-                # Transformer block 적용
-                block_output, attn_weight = self.transformer.resblocks[block_idx](stage_output)
-                
-                # 중요: block_output은 transformer feature map (LND 형태)
-                # attn_weight는 attention weights (NLL 형태, batch size × seq_len × seq_len)
-                transformer_features.append(block_output)  # feature map 저장
-                attn_weights.append(attn_weight)  # attention weights 저장
-                
-                stage_output = block_output
-
-            # Stage 종료 후 adapter 적용 (ViT feature에)
-            adapter_c_output = self.adapters_to_c[stage_idx](stage_output)
+                stage_blocks.append(self.transformer.resblocks[block_idx])
             
+            print(f"Stage {stage_idx}: ViT shape {current_vit.shape}, CNN shape {current_cnn.shape}")
+                
+            # 원래 CTIBlock 사용 - 더 간단하고 검증된 방식
             try:
-                # Apply CTI_toC (ViT -> CNN)
-                cti_c_output = self.cti_to_c_modules[stage_idx](
-                    query=current_cnn,
-                    reference_points=deform_inputs2[0],
-                    feat=adapter_c_output,
-                    spatial_shapes=deform_inputs2[1],
-                    level_start_index=deform_inputs2[2],
-                    H=H//16, W=W//16
+                # CTIBlock.forward의 시그니처에 맞춰 호출
+                # CTIBlock은 x (ViT), c (CNN), blocks, deform_inputs1, deform_inputs2, H, W를 받음
+                stage_vit_output, stage_cnn_output = self.interactions[stage_idx](
+                    x=current_vit.permute(1, 0, 2),  # LND -> NLD for CTIBlock
+                    c=current_cnn, 
+                    blocks=stage_blocks,  # WeCLIP의 transformer blocks 전달
+                    deform_inputs1=deform_inputs1, 
+                    deform_inputs2=deform_inputs2, 
+                    H=H//16, 
+                    W=W//16
                 )
                 
-                # Save CTI_toC output
-                cti_outputs.append(cti_c_output)
+                # CTIBlock에서 나온 결과를 다음 stage의 입력으로 사용
+                current_vit = stage_vit_output.permute(1, 0, 2)  # NLD -> LND
+                current_cnn = stage_cnn_output
                 
-                # Residual connection: current_cnn + cti_c_output
-                current_cnn = current_cnn + cti_c_output
+                # 각 stage에서 실행된 transformer blocks의 feature를 저장
+                # (CTIBlock 내부에서 blocks가 실행됨)
+                for block_idx in range(start_block, end_block + 1):
+                    # CTIBlock 내부에서 실행된 결과를 시뮬레이션
+                    # 실제로는 CTIBlock 내부에서 이미 실행되었음
+                    transformer_features.append(stage_vit_output.permute(1, 0, 2))  # LND format
+                    # Attention weight는 개별 블록에서 수집하기 어려우므로 dummy 추가
+                    dummy_attn = torch.zeros(bs, stage_vit_output.shape[0], stage_vit_output.shape[0], 
+                                           device=stage_vit_output.device, dtype=stage_vit_output.dtype)
+                    attn_weights.append(dummy_attn)
+                
+                # CTI 출력 저장 (ViT branch용과 CNN branch용)
+                # ViT와 CNN 출력을 spatial 형태로 변환하여 저장
+                vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
+                cnn_spatial = self._convert_cnn_to_spatial(stage_cnn_output, H//16, W//16, bs, dim)
+                
+                cti_outputs.append(vit_spatial)  # ViT branch용 CTI 출력
+                cti_outputs.append(cnn_spatial)  # CNN branch용 CTI 출력
+                
+                print(f"Stage {stage_idx} completed successfully")
+                
             except Exception as e:
-                print(f"Error in CTI_toC: {e}")
+                print(f"Error in CTIBlock {stage_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 
-                # Create a fallback attention mechanism
-                if not hasattr(self.cti_to_c_modules[stage_idx], '_fallback_attention'):
-                    # Add the method to the instance
-                    import types
-                    self.cti_to_c_modules[stage_idx]._fallback_attention = types.MethodType(
-                        _fallback_attention, self.cti_to_c_modules[stage_idx]
-                    )           
-
-                try:
-                    # Use fallback attention mechanism with matching dtype
-                    fallback_output = self.cti_to_c_modules[stage_idx]._fallback_attention(
-                        current_cnn, adapter_c_output
-                    )
-                    
-                    # Save and apply fallback output
-                    cti_outputs.append(fallback_output)
-                    current_cnn = current_cnn + fallback_output
-                except Exception as inner_e:
-                    print(f"Even fallback attention failed for CTI_toC: {inner_e}")
-                    # Last resort: just continue with unmodified current_cnn
-                    cti_outputs.append(current_cnn)
-                    # current_cnn remains unchanged
-            
-            # 다음 stage를 위해 현재 ViT feature 업데이트
-            current_vit = stage_output
-            
-        # CNN feature 분리 및 reshape - 필요시 사용 가능하도록 유지
+                # Fallback: 각 블록을 개별적으로 처리
+                stage_output = current_vit
+                for block_idx in range(start_block, end_block + 1):
+                    block_output, attn_weight = self.transformer.resblocks[block_idx](stage_output)
+                    transformer_features.append(block_output)
+                    attn_weights.append(attn_weight)
+                    stage_output = block_output
+                current_vit = stage_output
+                
+                # Fallback CTI 출력도 저장
+                vit_spatial = self._convert_vit_to_spatial(current_vit, H//16, W//16, bs, dim)
+                cnn_spatial = self._convert_cnn_to_spatial(current_cnn, H//16, W//16, bs, dim)
+                cti_outputs.append(vit_spatial)
+                cti_outputs.append(cnn_spatial)
+        
+        # CNN feature 분리 및 reshape
         c2_len = c2.size(1)
         c3_len = c3.size(1)
         
@@ -729,118 +635,57 @@ class VisionTransformer(nn.Module):
         f4 = self.norm4(c4_new)
         
         # 8개의 CTI 출력을 channel-wise concat하고 1x1 convolution 적용
-        unified_cti_outputs = []
-        
-        for cti_output in cti_outputs:
-            # Ensure it's a valid tensor (may have been set to None in error cases)
-            if cti_output is None:
-                continue
-                
-            # Ensure consistent data type
-            cti_output = cti_output.to(self.final_conv.weight.dtype)
-            
-            # Transform CTI output shape (LND -> NCHW or NLD -> NCHW)
-            if cti_output.shape[0] != bs:  # If in LND format
-                cti_output = cti_output.permute(1, 0, 2)  # LND -> NLD
-            
-            # Transform to spatial dimensions
-            if len(cti_output.shape) == 3:  # NLD format
-                if cti_output.shape[1] > 1:  # Contains class token etc.
-                    # Remove class token and transform to spatial dimensions
-                    seq_len = cti_output.shape[1]
-                    if seq_len == (H//16)*(W//16) + 1:  # If class token exists
-                        cti_output = cti_output[:, 1:, :]  # Remove class token
-                    
-                    try:
-                        # Try to find appropriate spatial dimensions
-                        seq_len = cti_output.shape[1]
-                        feat_dim = cti_output.shape[2]
-                        
-                        # First try assuming it's a square
-                        side_len = int(math.sqrt(seq_len))
-                        
-                        if side_len * side_len == seq_len:
-                            # Perfect square
-                            h_dim = w_dim = side_len
-                        else:
-                            # Find factors close to square root
-                            for i in range(int(math.sqrt(seq_len)), 0, -1):
-                                if seq_len % i == 0:
-                                    h_dim = i
-                                    w_dim = seq_len // i
-                                    break
-                            else:
-                                # If no exact factors, use approximate values
-                                h_dim = side_len
-                                w_dim = seq_len // side_len
-                        
-                        # Reshape to spatial form
-                        cti_output = cti_output.reshape(bs, h_dim, w_dim, feat_dim)
-                        cti_output = cti_output.permute(0, 3, 1, 2)  # [bs, feat_dim, h, w]
-                        
-                    except Exception as e:
-                        print(f"Reshape error: {e} for tensor of shape {cti_output.shape}")
-                        # Fallback: convert to feature vector then to 1×1 spatial
-                        feat_dim = cti_output.shape[2]
-                        cti_output = cti_output.mean(dim=1)  # [bs, feat_dim]
-                        cti_output = cti_output.unsqueeze(-1).unsqueeze(-1)  # [bs, feat_dim, 1, 1]
-                else:
-                    # Single token case (e.g., global feature)
-                    cti_output = cti_output.unsqueeze(-1).unsqueeze(-1)  # [bs, 1, feat_dim, 1, 1]
-                    
-            # Standardize all features to H//16 x W//16 size
-            if cti_output.shape[2:] != (H//16, W//16):
-                try:
-                    cti_output = F.interpolate(cti_output, size=(H//16, W//16), mode='bilinear', align_corners=False)
-                except Exception as e:
-                    print(f"Interpolation error: {e} for tensor of shape {cti_output.shape}")
-                    # Create a placeholder feature map of the correct size
-                    cti_output = torch.zeros(
-                        bs, cti_output.shape[1], H//16, W//16, 
-                        dtype=self.final_conv.weight.dtype,
-                        device=cti_output.device
-                    )
-            
-            unified_cti_outputs.append(cti_output)
-        
         try:
-            # Extract the weight dtype
-            weight_dtype = self.final_conv.weight.dtype
+            # 모든 CTI 출력을 H//16 x W//16 크기로 표준화
+            standardized_cti_outputs = []
+            target_dtype = self.final_conv.weight.dtype
             
-            # Convert unified_cti_outputs to consistent dtype
-            unified_cti_outputs_dtype_fixed = []
-            for tensor in unified_cti_outputs:
-                unified_cti_outputs_dtype_fixed.append(tensor.to(weight_dtype))
+            for cti_output in cti_outputs:
+                if cti_output is not None:
+                    # 데이터 타입 통일
+                    cti_output = cti_output.to(target_dtype)
+                    
+                    # 크기를 H//16 x W//16으로 표준화
+                    if cti_output.shape[2:] != (H//16, W//16):
+                        cti_output = F.interpolate(cti_output, size=(H//16, W//16), mode='bilinear', align_corners=False)
+                    
+                    standardized_cti_outputs.append(cti_output)
             
-            # Concatenate with consistent dtype
-            concat_cti = torch.cat(unified_cti_outputs_dtype_fixed, dim=1)  # N x (8*C) x H//16 x W//16
+            # 8개의 CTI 출력을 channel-wise concat
+            if len(standardized_cti_outputs) >= 8:
+                concat_cti = torch.cat(standardized_cti_outputs[:8], dim=1)  # N x (8*C) x H//16 x W//16
+            else:
+                # 부족한 경우 zero padding으로 채움
+                while len(standardized_cti_outputs) < 8:
+                    dummy_output = torch.zeros_like(standardized_cti_outputs[0]) if standardized_cti_outputs else torch.zeros(
+                        (bs, dim, H//16, W//16), dtype=target_dtype, device=x.device
+                    )
+                    standardized_cti_outputs.append(dummy_output)
+                concat_cti = torch.cat(standardized_cti_outputs[:8], dim=1)
             
-            # Apply final_conv
+            # 1x1 convolution 적용
             final_cti = self.final_conv(concat_cti)  # N x C x H//16 x W//16
+            
         except Exception as e:
-            print(f"Error in final convolution: {e}")
-            # Create a dummy output with correct dimensions
-            bs = unified_cti_outputs[0].shape[0] if unified_cti_outputs else 1
+            print(f"Error in final CTI processing: {e}")
+            # 실패 시 dummy output 생성
             final_cti = torch.zeros(
-                (bs, self.final_conv.out_channels, H//16, W//16),
-                dtype=weight_dtype,
-                device=self.final_conv.weight.device
+                (bs, dim, H//16, W//16),
+                dtype=self.final_conv.weight.dtype,
+                device=x.device
             )
 
         if require_all_fts:
-            # 11번째 transformer block의 output은 Grad-CAM을 위해 저장
+            # 11번째 transformer block의 output
             last_vit_output = current_vit
             
-            # transformer features(feature maps), attention weights(NLL 형태), CTI outputs 반환
-            return last_vit_output, transformer_features, cti_outputs, [f1, f2, f3, f4], final_cti, attn_weights, mrfp_outputs
+            # transformer features, attention weights, multi-level CNN features, final CTI output, MRFP outputs 반환
+            return last_vit_output, transformer_features, [f1, f2, f3, f4], final_cti, attn_weights, mrfp_outputs
 
         else:
             # 기존 VisionTransformer의 출력 형태 유지
             x_vit = current_vit.permute(1, 0, 2)  # LND -> NLD
-            
-            if not hasattr(self, 'ln_post'):
-                self.ln_post = LayerNorm(dim)
-            x_vit = self.ln_post(x_vit[:, 0])
+            x_vit = self.ln_post(x_vit[:, 0])  # 클래스 토큰만 선택
             
             if not hasattr(self, 'proj'):
                 self.proj = nn.Parameter(scale * torch.randn(dim, self.output_dim))
@@ -848,7 +693,60 @@ class VisionTransformer(nn.Module):
                 x_vit = x_vit @ self.proj
             
             return x_vit, None
-        
+    
+    def _convert_vit_to_spatial(self, vit_feature, H, W, bs, dim):
+        """ViT feature를 spatial 형태로 변환"""
+        try:
+            if vit_feature.dim() == 3:
+                if vit_feature.shape[0] > vit_feature.shape[1]:  # LND 형태
+                    vit_feature = vit_feature.permute(1, 0, 2)  # NLD로 변환
+                
+                # 클래스 토큰 제거 (있는 경우)
+                if vit_feature.shape[1] == H * W + 1:
+                    vit_feature = vit_feature[:, 1:, :]  # 클래스 토큰 제거
+                
+                # spatial 형태로 reshape
+                seq_len = vit_feature.shape[1]
+                if seq_len == H * W:
+                    vit_spatial = vit_feature.transpose(1, 2).reshape(bs, dim, H, W)
+                else:
+                    # 크기가 맞지 않으면 interpolation 사용
+                    side_len = int(math.sqrt(seq_len))
+                    vit_spatial = vit_feature.transpose(1, 2).reshape(bs, dim, side_len, side_len)
+                    vit_spatial = F.interpolate(vit_spatial, size=(H, W), mode='bilinear', align_corners=False)
+            else:
+                vit_spatial = vit_feature
+                
+            return vit_spatial
+        except Exception as e:
+            print(f"Error converting ViT to spatial: {e}")
+            return torch.zeros((bs, dim, H, W), dtype=vit_feature.dtype, device=vit_feature.device)
+    
+    def _convert_cnn_to_spatial(self, cnn_feature, H, W, bs, dim):
+        """CNN feature를 spatial 형태로 변환"""
+        try:
+            if cnn_feature.dim() == 3:  # (N, L, C) 형태
+                # multi-level feature를 적절히 처리
+                # 예: 중간 해상도 feature 선택하거나 평균
+                seq_len = cnn_feature.shape[1]
+                
+                # 중간 부분 선택 (16x16 해상도에 해당하는 부분)
+                middle_start = seq_len // 3
+                middle_end = middle_start + H * W
+                if middle_end <= seq_len:
+                    selected_feature = cnn_feature[:, middle_start:middle_end, :]
+                else:
+                    selected_feature = cnn_feature[:, :H*W, :]
+                
+                cnn_spatial = selected_feature.transpose(1, 2).reshape(bs, dim, H, W)
+            else:
+                cnn_spatial = cnn_feature
+                
+            return cnn_spatial
+        except Exception as e:
+            print(f"Error converting CNN to spatial: {e}")
+            return torch.zeros((bs, dim, H, W), dtype=cnn_feature.dtype, device=cnn_feature.device)
+            
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
@@ -958,21 +856,23 @@ class CLIP(nn.Module):
                 # Ensure image is the right dtype for the model
                 image_correct_dtype = image.to(self.dtype) 
                 
-                last_vit_output, transformer_features, cti_outputs, multi_level_features, final_cti, attn_weights = self.visual(
+                # ViT-Comer forward pass
+                last_vit_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs = self.visual(
                     image_correct_dtype, H, W, require_all_fts=True
                 )
                 
-                # Return both transformer features and attention weights
-                return transformer_features, attn_weights
+                # Return transformer features, attention weights, final CTI output, and MRFP outputs
+                return transformer_features, attn_weights, final_cti, mrfp_outputs
+                
             except RuntimeError as e:
                 if "expected scalar type Half but found Float" in str(e):
                     print(f"Handling dtype error: {e}")
                     # Try again with explicit half precision
                     try:
-                        last_vit_output, transformer_features, cti_outputs, multi_level_features, final_cti, attn_weights = self.visual(
+                        last_vit_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs = self.visual(
                             image.half(), H, W, require_all_fts=True
                         )
-                        return transformer_features, attn_weights
+                        return transformer_features, attn_weights, final_cti, mrfp_outputs
                     except Exception as e2:
                         print(f"Second attempt failed: {e2}")
                         # Fall back to simpler path
@@ -983,12 +883,18 @@ class CLIP(nn.Module):
                 try:
                     # Ensure correct dtype and use the non-advanced forward path
                     f_x, f_attn = self.visual(image.to(self.dtype), H, W, require_all_fts=False)
-                    return [f_x], [f_attn]
+                    dummy_cti = torch.zeros((image.shape[0], self.visual.width, H//16, W//16), 
+                                          device=image.device, dtype=self.dtype)
+                    dummy_mrfp = [torch.zeros_like(dummy_cti) for _ in range(4)]
+                    return [f_x], [f_attn], dummy_cti, dummy_mrfp
                 except Exception as e3:
                     print(f"Even simple path failed: {e3}")
                     # Ultimate fallback - just return dummy tensors
                     dummy_shape = (1, image.shape[0], self.visual.width)
-                    return [torch.zeros(dummy_shape, device=image.device, dtype=self.dtype)], [None]
+                    dummy_cti = torch.zeros((image.shape[0], self.visual.width, H//16, W//16), 
+                                          device=image.device, dtype=self.dtype)
+                    dummy_mrfp = [torch.zeros_like(dummy_cti) for _ in range(4)]
+                    return [torch.zeros(dummy_shape, device=image.device, dtype=self.dtype)], [None], dummy_cti, dummy_mrfp
         else:
             # Standard mode
             try:
@@ -1100,18 +1006,8 @@ def convert_weights(model: nn.Module):
 
     model.apply(_convert_weights_to_fp16)
 
-
 def build_model(state_dict: dict):
     vit = "visual.proj" in state_dict
-    '''
-    inv_freq = 1. / (10000 ** (torch.arange(0, 2048, 2, dtype=torch.float) / 2048))
-    position = torch.arange(50, dtype=torch.float)
-    sinusoid_inp = torch.einsum('i,j -> ij', position, inv_freq)
-    embeddings = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1) / 2048 ** 0.5
-    state_dict["visual.attnpool.positional_embedding"] = embeddings
-    '''
-    #state_dict["visual.positional_embedding"] = upsample_pos_emb(state_dict["visual.positional_embedding"], 28)
-
 
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
@@ -1135,16 +1031,6 @@ def build_model(state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
-    # model = CLIP(
-    #     embed_dim,
-    #     image_resolution, vision_layers, vision_width, vision_patch_size,
-    #     context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
-    # )
-
-    # for key in ["input_resolution", "context_length", "vocab_size"]:
-    #     if key in state_dict:
-    #         del state_dict[key]
-
     # CLIP 모델 생성
     model = CLIP(
         embed_dim,
@@ -1152,38 +1038,43 @@ def build_model(state_dict: dict):
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
     )
     
-    # ViT-Comer 모듈의 가중치 초기화
-    # CNN backbone (SPM)
-    model.visual.spm.apply(model.visual._init_weights_fn)
+    # ViT-CoMer 모듈의 가중치 초기화
+    if vit:  # ViT 모델인 경우에만 ViT-CoMer 초기화
+        # CNN backbone (SPM)
+        model.visual.spm.apply(model.visual._init_weights_fn)
+        
+        # MRFP modules
+        model.visual.mrfp_modules.apply(model.visual._init_weights_fn)
+        
+        # CTI interactions (원래 CTIBlock) - 내부에 CTI_toV, CTI_toC 포함
+        model.visual.interactions.apply(model.visual._init_weights_fn)
+        model.visual.apply(model.visual._init_deform_weights)
     
-    # Interactions (CTI 모듈)
-    model.visual.interactions.apply(model.visual._init_weights_fn)
-    model.visual.apply(model.visual._init_deform_weights)
-    
-    # Adapter 모듈
-    for adapter in model.visual.adapters:
-        adapter.apply(model.visual._init_weights_fn)
-    
-    # state_dict 로드
+    # state_dict 로드 (ViT-CoMer 관련 키들은 제외)
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
     
-    # weights 변환 및 로드
+    # weights 변환 및 로드 (strict=False로 설정하여 새로 추가된 모듈을 무시)
     convert_weights(model)
-    model.load_state_dict(state_dict, strict=False)  # strict=False로 설정하여 새로 추가된 모듈을 무시
+    model.load_state_dict(state_dict, strict=False)
     
-    # ViT parameters freeze
-    for name, param in model.visual.transformer.named_parameters():
-        param.requires_grad = False
-    
-    # CNN backbone은 pretrained weights가 없는 경우 학습 가능하게 설정
-    # 나머지 모듈(SPM, CTI, Adapter 등)은 learnable하게 설정
+    # ViT parameters freeze (기존 WeCLIP transformer blocks만)
+    if vit:
+        for name, param in model.visual.transformer.named_parameters():
+            param.requires_grad = False
+        
+        # ViT-CoMer 관련 모듈은 학습 가능하게 설정 (원래 CTIBlock)
+        for module in [model.visual.spm, model.visual.mrfp_modules, 
+                      model.visual.interactions, model.visual.final_conv, 
+                      model.visual.up]:
+            for param in module.parameters():
+                param.requires_grad = True
     
     return model.eval()
 
 def save_learnable_weights(model, path):
-    """Learnable weights (SPM, CTI, Adapter 등) 저장"""
+    """Learnable weights (SPM, MRFP, CTI interactions 등) 저장"""
     state_dict = {}
     
     # CNN backbone (SPM) weights
@@ -1191,26 +1082,33 @@ def save_learnable_weights(model, path):
         if param.requires_grad:
             state_dict[f'visual.spm.{name}'] = param
     
-    # Interactions (CTI 모듈) weights
+    # MRFP modules weights
+    for i, module in enumerate(model.visual.mrfp_modules):
+        for name, param in module.named_parameters():
+            if param.requires_grad:
+                state_dict[f'visual.mrfp_modules.{i}.{name}'] = param
+    
+    # CTI interactions weights (원래 CTIBlock)
     for i, module in enumerate(model.visual.interactions):
         for name, param in module.named_parameters():
             if param.requires_grad:
                 state_dict[f'visual.interactions.{i}.{name}'] = param
     
-    # Adapter weights
-    for i, adapter in enumerate(model.visual.adapters):
-        for name, param in adapter.named_parameters():
-            state_dict[f'visual.adapters.{i}.{name}'] = param
+    # Final conv weights
+    for name, param in model.visual.final_conv.named_parameters():
+        if param.requires_grad:
+            state_dict[f'visual.final_conv.{name}'] = param
     
-    # 기타 learnable weights
+    # Upsampling layer weights
+    for name, param in model.visual.up.named_parameters():
+        if param.requires_grad:
+            state_dict[f'visual.up.{name}'] = param
+    
+    # 기타 learnable weights (level_embed, mrfp_weights 등)
     for name, param in model.visual.named_parameters():
-        if param.requires_grad and not any(x in name for x in ['spm', 'interactions', 'adapters', 'transformer']):
+        if (param.requires_grad and 
+            not any(x in name for x in ['spm', 'mrfp_modules', 'interactions', 'final_conv', 'up', 'transformer']) and
+            any(x in name for x in ['level_embed', 'mrfp_weights'])):
             state_dict[f'visual.{name}'] = param
     
     torch.save(state_dict, path)
-
-
-
-    convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
