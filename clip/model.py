@@ -315,6 +315,130 @@ class Adapter(nn.Module):
         x = self.up_proj(x)
         return shortcut + x
 
+class VisionTransformer(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.width = width
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+        self.ln_post = LayerNorm(width)
+
+        # WeCLIP의 transformer blocks 사용
+        self.transformer = Transformer(width, layers, heads)
+        self.patch_size = patch_size
+        
+        # ViT-Comer에서 추가된 부분
+        self.pretrain_size = (input_resolution, input_resolution)
+        
+        # Stage 구분 (총 11개의 block을 4개 stage로 나눔)
+        self.stage_indices = [
+            [0, 1],  # Stage 1: 블록 0-1 (2개)
+            [2, 4],  # Stage 2: 블록 2-4 (3개)
+            [5, 7],  # Stage 3: 블록 5-7 (3개)
+            [8, 10]  # Stage 4: 블록 8-10 (3개)
+        ]
+        
+        # CNN backbone 추가
+        self.spm = CNN(inplanes=64, embed_dim=width)
+        self.level_embed = nn.Parameter(torch.zeros(3, width))
+        
+        # MRFP 모듈 (Multi-Resolution Feature Processing)
+        self.mrfp_modules = nn.ModuleList([
+            MRFP(width, hidden_features=int(width * 6.0))
+            for _ in range(len(self.stage_indices))
+        ])
+        
+        # CTIBlock 모듈들 - 원래 ViT-CoMer의 CTIBlock 사용
+        self.interactions = nn.ModuleList([
+            CTIBlock(dim=width, num_heads=heads//2, n_points=4,
+                    init_values=0., drop_path=0.1,
+                    norm_layer=LayerNorm, with_cffn=True,
+                    cffn_ratio=0.25, deform_ratio=1.0,
+                    use_CTI_toV=True, use_CTI_toC=True,
+                    dim_ratio=6.0,
+                    cnn_feature_interaction=True,
+                    extra_CTI=(i == len(self.stage_indices) - 1))
+            for i in range(len(self.stage_indices))
+        ])
+
+        # 최종 출력을 위한 normalization layers
+        self.norm1 = nn.BatchNorm2d(width)
+        self.norm2 = nn.BatchNorm2d(width)
+        self.norm3 = nn.BatchNorm2d(width)
+        self.norm4 = nn.BatchNorm2d(width)
+        
+        # 업샘플링 레이어
+        self.up = nn.ConvTranspose2d(width, width, 2, 2)
+        
+        # 8개의 CTI 출력을 channel-wise concat 후 적용할 1x1 convolution
+        self.final_conv = nn.Conv2d(width * 8, width, kernel_size=1)
+
+        # MRFP 결과를 CNN feature에 통합하기 위한 learnable weights
+        self.mrfp_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
+        ])
+
+        # 초기화
+        self._init_weights()
+
+    def _init_weights(self):
+        # SPM, MRFP, CTI interactions 등의 가중치 초기화
+        self.spm.apply(self._init_weights_fn)
+        self.mrfp_modules.apply(self._init_weights_fn)
+        self.interactions.apply(self._init_weights_fn)
+        self.up.apply(self._init_weights_fn)
+        self.final_conv.apply(self._init_weights_fn)
+        nn.init.normal_(self.level_embed, std=0.02)
+        
+    def _init_weights_fn(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm) or isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+                
+    def _init_deform_weights(self, m):
+        if isinstance(m, MSDeformAttn):
+            m._reset_parameters()
+
+    def _add_level_embed(self, c2, c3, c4):
+        c2 = c2 + self.level_embed[0]
+        c3 = c3 + self.level_embed[1]
+        c4 = c4 + self.level_embed[2]
+        return c2, c3, c4
+    
+    def _get_pos_embed(self, pos_embed, H, W):
+        # Extract class token and remaining position embeddings
+        class_pos_embed = pos_embed[:1]
+        pos_embed = pos_embed[1:]
+        
+        # Determine original grid size
+        grid_size = int(math.sqrt(pos_embed.shape[0]))
+        
+        # Reshape and interpolate
+        pos_embed = pos_embed.reshape(1, grid_size, grid_size, -1).permute(0, 3, 1, 2)
+        pos_embed = F.interpolate(pos_embed, size=(H, W), mode='bicubic', align_corners=False)
+        pos_embed = pos_embed.reshape(1, -1, H * W).permute(0, 2, 1)
+        
+        # Add class token back
+        pos_embed = torch.cat([class_pos_embed.unsqueeze(0), pos_embed], dim=1)
+        
+        return pos_embed
+    
     def forward(self, x: torch.Tensor, H, W, require_all_fts=False):
         # deform_inputs 준비
         deform_inputs1, deform_inputs2 = deform_inputs(x)
@@ -434,17 +558,8 @@ class Adapter(nn.Module):
                 
                 standardized_cti_outputs.append(cti_output)
         
-        # 8개의 CTI 출력을 channel-wise concat
-        if len(standardized_cti_outputs) >= 8:
-            concat_cti = torch.cat(standardized_cti_outputs[:8], dim=1)  # N x (8*C) x H//16 x W//16
-        else:
-            # 부족한 경우 zero padding으로 채움
-            while len(standardized_cti_outputs) < 8:
-                dummy_output = torch.zeros_like(standardized_cti_outputs[0]) if standardized_cti_outputs else torch.zeros(
-                    (bs, dim, H//16, W//16), dtype=target_dtype, device=x.device
-                )
-                standardized_cti_outputs.append(dummy_output)
-            concat_cti = torch.cat(standardized_cti_outputs[:8], dim=1)
+        # CTI 출력을 channel-wise concat
+        concat_cti = torch.cat(standardized_cti_outputs, dim=1)  # N x (C) x H x W
         
         # 1x1 convolution 적용
         final_cti = self.final_conv(concat_cti)  # N x C x H//16 x W//16
