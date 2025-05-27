@@ -456,15 +456,15 @@ class VisionTransformer(nn.Module):
         
         # ViT branch 초기화 - WeCLIP 방식
         self.positional_embedding_new = upsample_pos_emb(self.positional_embedding, (H//16, W//16))
-        x_vit = self.conv1(x)  # shape = [*, width, grid, grid]
-        x_vit = x_vit.reshape(x_vit.shape[0], x_vit.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x_vit = x_vit.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x_vit = torch.cat([self.class_embedding.to(x_vit.dtype) + torch.zeros(x_vit.shape[0], 1, x_vit.shape[-1], dtype=x_vit.dtype, device=x_vit.device), x_vit], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x_vit = x_vit + self.positional_embedding_new.to(x_vit.dtype)
-        x_vit = self.ln_pre(x_vit)
-        x_vit = x_vit.permute(1, 0, 2)  # NLD -> LND
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding_new.to(x.dtype)
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
 
-        bs, _, dim = x_vit.shape[1], x_vit.shape[0], x_vit.shape[2]
+        bs, _, dim = x.shape[1], x.shape[0], x.shape[2]
         
         # attention weight를 저장할 리스트와 transformer feature map을 저장할 리스트
         attn_weights = []
@@ -477,7 +477,7 @@ class VisionTransformer(nn.Module):
         mrfp_outputs = []
 
         # 현재 ViT 및 CNN feature
-        current_vit = x_vit
+        current_vit = x
         current_cnn = c
 
         # 각 stage 별로 원래 CTIBlock 사용
