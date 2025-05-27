@@ -459,9 +459,6 @@ class VisionTransformer(nn.Module):
         
         # CTI 출력들을 저장할 리스트 (CNN branch용 4개 + ViT branch용 4개 = 총 8개)
         cti_outputs = []
-        
-        # MRFP outputs를 저장할 리스트
-        mrfp_outputs = []
 
         # 현재 ViT 및 CNN feature
         current_vit = x
@@ -580,10 +577,7 @@ class VisionTransformer(nn.Module):
             # 11번째 transformer block (index 10)의 output
             last_transformer_output = transformer_features[-1] if transformer_features else current_vit
             
-            print(f"Total transformer blocks processed: {len(transformer_features)}")
-            print(f"Last transformer block (11th) output shape: {last_transformer_output.shape}")
-            
-            return last_transformer_output, transformer_features, [f1, f2, f3, f4], final_cti, attn_weights, mrfp_outputs
+            return last_transformer_output, transformer_features, [f1, f2, f3, f4], final_cti, attn_weights
 
         else:
             # 기존 VisionTransformer의 출력 형태 유지
@@ -730,17 +724,13 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, H, W, require_all_fts=True):
-        # VisionTransformer의 forward 메서드 호출
-        outputs = self.visual(image.type(self.dtype), H, W, require_all_fts=require_all_fts)
-        
+    def encode_image(self, image, H, W, require_all_fts=False):
         if require_all_fts:
-            # 모든 feature map과 attention weights 반환
-            last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs = outputs
-            return last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs
+            outputs = self.visual(image, H, W, require_all_fts=True)
+            last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights = outputs
+            return last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights
         else:
-            # 기본 이미지 인코딩 (projection이 적용된 클래스 토큰)
-            image_features, _ = outputs
+            image_features, _ = self.visual(image, H, W, require_all_fts=False)
             return image_features, None
     
     def encode_text(self, text):
@@ -783,11 +773,10 @@ class CLIP(nn.Module):
         return logits_per_image, attn_weight
 
     def forward(self, image, text):
-        image_features, feature_map, cls_attn = self.encode_image(image)
+        image_features, transformer_features, multi_level_features, final_cti, attn_weights = self.encode_image(image, image.shape[2], image.shape[3], require_all_fts=True)
         with torch.no_grad():
             text_features = self.encode_text(text)
-
-        return image_features, feature_map, cls_attn
+        return image_features, transformer_features, multi_level_features, final_cti, attn_weights
 
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
