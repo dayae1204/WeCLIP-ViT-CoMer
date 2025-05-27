@@ -367,7 +367,8 @@ class VisionTransformer(nn.Module):
                     use_CTI_toV=True, use_CTI_toC=True,
                     dim_ratio=6.0,
                     cnn_feature_interaction=True,
-                    extra_CTI=(i == len(self.stage_indices) - 1))
+                    extra_CTI=(i == len(self.stage_indices) - 1),
+                    adapter=self.adapters_to_c[i])  # adapter를 CTIBlock에 전달
             for i in range(len(self.stage_indices))
         ])
 
@@ -508,9 +509,6 @@ class VisionTransformer(nn.Module):
             # CTIBlock에서 나온 결과를 다음 stage의 입력으로 사용
             current_vit = stage_vit_output.permute(1, 0, 2)  # NLD -> LND
             current_cnn = stage_cnn_output
-            
-            # Adapter 통과
-            current_cnn = self.adapters_to_c[stage_idx](current_cnn)
             
             # 각 블록별 transformer_features 저장 (개별 블록 단위로)
             for block_idx in range(start_block, end_block + 1):
