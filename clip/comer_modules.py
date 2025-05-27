@@ -403,11 +403,13 @@ class CTIBlock(nn.Module):
 
     def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
         B, N, C = x.shape
-        deform_inputs = deform_inputs_only_one(x, H*16, W*16)
-        
+
         # class token 저장
         cls_token = x[0:1]
         x = x[1:]  # class token 제거
+
+        deform_inputs = deform_inputs_only_one(x, H*16, W*16)
+    
         
         if self.use_CTI_toV:
             c = self.mrfp(c, H, W)
