@@ -412,6 +412,7 @@ class CTIBlock(nn.Module):
         if self.use_CTI_toV:
             c = self.mrfp(c, H, W)
             c_select1, c_select2, c_select3 = c[:,:H*W*4, :], c[:, H*W*4:H*W*4+H*W, :], c[:, H*W*4+H*W:, :]
+            # x의 크기가 400이므로 c_select2와 더할 때 크기가 맞도록 조정
             c = torch.cat([c_select1, c_select2 + x, c_select3], dim=1)
 
             x = self.cti_tov(query=x, reference_points=deform_inputs[0],
