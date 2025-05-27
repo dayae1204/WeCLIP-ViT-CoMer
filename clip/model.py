@@ -389,20 +389,6 @@ class VisionTransformer(nn.Module):
             nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
         ])
 
-        # 초기화
-        self._init_weights()
-
-    def _init_weights(self):
-        # SPM, MRFP, CTI interactions 등의 가중치 초기화
-        self.spm.apply(self._init_weights_fn)
-        self.mrfp_modules.apply(self._init_weights_fn)
-        self.interactions.apply(self._init_weights_fn)
-        self.up.apply(self._init_weights_fn)
-        self.final_conv.apply(self._init_weights_fn)
-        nn.init.normal_(self.level_embed, std=0.02)
-
-        self.adapters_to_c.apply(self._init_weights_fn)
-        
     def _init_weights_fn(self, m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=.02)
@@ -860,15 +846,12 @@ def build_model(state_dict: dict):
     
     # ViT-CoMer 모듈의 가중치 초기화
     if vit:  # ViT 모델인 경우에만 ViT-CoMer 초기화
-        # CNN backbone (SPM)
-        model.visual.spm.apply(model.visual._init_weights_fn)
-        
-        # MRFP modules
-        model.visual.mrfp_modules.apply(model.visual._init_weights_fn)
-        
-        # CTI interactions (원래 CTIBlock) - 내부에 CTI_toV, CTI_toC 포함
-        model.visual.interactions.apply(model.visual._init_weights_fn)
+        # 모든 ViT-CoMer 모듈 초기화
+        model.visual.apply(model.visual._init_weights_fn)
         model.visual.apply(model.visual._init_deform_weights)
+        
+        # Level embedding 초기화
+        nn.init.normal_(model.visual.level_embed, std=0.02)
     
     # state_dict 로드 (ViT-CoMer 관련 키들은 제외)
     for key in ["input_resolution", "context_length", "vocab_size"]:
@@ -881,13 +864,25 @@ def build_model(state_dict: dict):
     
     # ViT parameters freeze (기존 WeCLIP transformer blocks만)
     if vit:
+        # 기존 WeCLIP transformer blocks는 freeze
         for name, param in model.visual.transformer.named_parameters():
             param.requires_grad = False
         
-        # ViT-CoMer 관련 모듈은 학습 가능하게 설정 (원래 CTIBlock)
-        for module in [model.visual.spm, model.visual.mrfp_modules, 
-                      model.visual.interactions, model.visual.final_conv, 
-                      model.visual.up]:
+        # ViT-CoMer 관련 모듈은 학습 가능하게 설정
+        learnable_modules = [
+            model.visual.spm,  # CNN backbone
+            model.visual.mrfp_modules,  # MRFP modules
+            model.visual.interactions,  # CTI interactions
+            model.visual.final_conv,  # Final convolution
+            model.visual.up,  # Upsampling layer
+            model.visual.adapters_to_c,  # Adapters
+            model.visual.norm1,  # Normalization layers
+            model.visual.norm2,
+            model.visual.norm3,
+            model.visual.norm4
+        ]
+        
+        for module in learnable_modules:
             for param in module.parameters():
                 param.requires_grad = True
     
