@@ -519,7 +519,6 @@ class VisionTransformer(nn.Module):
                     transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
                 else:
                     # 중간 블록들은 CTIBlock 내부에서 처리되므로 stage 출력을 근사값으로 사용
-                    # 실제로는 CTIBlock에서 개별 출력을 받아야 하지만, 현재 구조에서는 근사
                     _, _, _, last_transformer_output = stage_vit_output
                     transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
             
@@ -545,6 +544,26 @@ class VisionTransformer(nn.Module):
         c3_new = c3_new.transpose(1, 2).view(bs, dim, H//16, W//16).contiguous()
         c4_new = c4_new.transpose(1, 2).view(bs, dim, H//32, W//32).contiguous()
         c1_new = self.up(c2_new) + c1
+        
+        # ViT feature를 CNN feature에 더하기
+        # transformer_features에서 각 stage의 마지막 transformer block 출력 사용
+        vit_spatial_features = []
+        for i in range(0, len(transformer_features), 3):  # 각 stage의 마지막 블록
+            if i + 2 < len(transformer_features):  # stage가 완전한 경우
+                vit_feat = transformer_features[i+2]
+                vit_spatial = self._convert_vit_to_spatial(vit_feat, H//16, W//16, bs, dim)
+                vit_spatial_features.append(vit_spatial)
+        
+        # ViT feature를 CNN feature에 더하기
+        x1 = F.interpolate(vit_spatial_features[0], scale_factor=4, mode='bilinear', align_corners=False)
+        x2 = F.interpolate(vit_spatial_features[1], scale_factor=2, mode='bilinear', align_corners=False)
+        x3 = vit_spatial_features[2]
+        x4 = F.interpolate(vit_spatial_features[3], scale_factor=0.5, mode='bilinear', align_corners=False)
+        
+        c1_new = c1_new + x1
+        c2_new = c2_new + x2
+        c3_new = c3_new + x3
+        c4_new = c4_new + x4
         
         # Final Norm
         f1 = self.norm1(c1_new)
