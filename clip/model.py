@@ -354,6 +354,10 @@ class VisionTransformer(nn.Module):
             for _ in range(len(self.stage_indices))
         ])
         
+        self.adapters_to_c = nn.ModuleList([
+            Adapter(width) for _ in range(len(self.stage_indices))
+        ])
+
         # CTIBlock 모듈들 - 원래 ViT-CoMer의 CTIBlock 사용
         self.interactions = nn.ModuleList([
             CTIBlock(dim=width, num_heads=heads//2, n_points=4,
@@ -395,6 +399,8 @@ class VisionTransformer(nn.Module):
         self.up.apply(self._init_weights_fn)
         self.final_conv.apply(self._init_weights_fn)
         nn.init.normal_(self.level_embed, std=0.02)
+
+        self.adapters_to_c.apply(self._init_weights_fn)
         
     def _init_weights_fn(self, m):
         if isinstance(m, nn.Linear):
@@ -502,6 +508,9 @@ class VisionTransformer(nn.Module):
             # CTIBlock에서 나온 결과를 다음 stage의 입력으로 사용
             current_vit = stage_vit_output.permute(1, 0, 2)  # NLD -> LND
             current_cnn = stage_cnn_output
+            
+            # Adapter 통과
+            current_cnn = self.adapters_to_c[stage_idx](current_cnn)
             
             # 각 블록별 transformer_features 저장 (개별 블록 단위로)
             for block_idx in range(start_block, end_block + 1):
