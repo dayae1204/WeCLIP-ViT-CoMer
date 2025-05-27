@@ -601,57 +601,39 @@ class VisionTransformer(nn.Module):
 
     def _convert_vit_to_spatial(self, vit_feature, H, W, bs, dim):
         """ViT feature를 spatial 형태로 변환"""
-        try:
-            if vit_feature.dim() == 3:
-                if vit_feature.shape[0] > vit_feature.shape[1]:  # LND 형태
-                    vit_feature = vit_feature.permute(1, 0, 2)  # NLD로 변환
-                
-                # 클래스 토큰 제거 (있는 경우)
-                if vit_feature.shape[1] == H * W + 1:
-                    vit_feature = vit_feature[:, 1:, :]  # 클래스 토큰 제거
-                
-                # spatial 형태로 reshape
-                seq_len = vit_feature.shape[1]
-                if seq_len == H * W:
-                    vit_spatial = vit_feature.transpose(1, 2).reshape(bs, dim, H, W)
-                else:
-                    # 크기가 맞지 않으면 interpolation 사용
-                    side_len = int(math.sqrt(seq_len))
-                    vit_spatial = vit_feature.transpose(1, 2).reshape(bs, dim, side_len, side_len)
-                    vit_spatial = F.interpolate(vit_spatial, size=(H, W), mode='bilinear', align_corners=False)
-            else:
-                vit_spatial = vit_feature
-                
-            return vit_spatial
-        except Exception as e:
-            print(f"Error converting ViT to spatial: {e}")
-            return torch.zeros((bs, dim, H, W), dtype=vit_feature.dtype, device=vit_feature.device)
-    
+
+        if vit_feature.shape[0] > vit_feature.shape[1]:  # LND 형태
+            vit_feature = vit_feature.permute(1, 0, 2)  # NLD로 변환
+        
+        # 클래스 토큰 제거 (있는 경우)
+        if vit_feature.shape[1] == H * W + 1:
+            vit_feature = vit_feature[:, 1:, :]  # 클래스 토큰 제거
+        
+        # spatial 형태로 reshape
+        seq_len = vit_feature.shape[1]
+        vit_spatial = vit_feature.transpose(1, 2).reshape(bs, dim, H, W)
+            
+        return vit_spatial
+
     def _convert_cnn_to_spatial(self, cnn_feature, H, W, bs, dim):
         """CNN feature를 spatial 형태로 변환"""
-        try:
-            if cnn_feature.dim() == 3:  # (N, L, C) 형태
-                # multi-level feature를 적절히 처리
-                # 예: 중간 해상도 feature 선택하거나 평균
-                seq_len = cnn_feature.shape[1]
-                
-                # 중간 부분 선택 (16x16 해상도에 해당하는 부분)
-                middle_start = seq_len // 3
-                middle_end = middle_start + H * W
-                if middle_end <= seq_len:
-                    selected_feature = cnn_feature[:, middle_start:middle_end, :]
-                else:
-                    selected_feature = cnn_feature[:, :H*W, :]
-                
-                cnn_spatial = selected_feature.transpose(1, 2).reshape(bs, dim, H, W)
-            else:
-                cnn_spatial = cnn_feature
-                
-            return cnn_spatial
-        except Exception as e:
-            print(f"Error converting CNN to spatial: {e}")
-            return torch.zeros((bs, dim, H, W), dtype=cnn_feature.dtype, device=cnn_feature.device)
-            
+
+        # multi-level feature를 적절히 처리
+        # 예: 중간 해상도 feature 선택하거나 평균
+        seq_len = cnn_feature.shape[1]
+        
+        # 중간 부분 선택 (16x16 해상도에 해당하는 부분)
+        middle_start = seq_len // 3
+        middle_end = middle_start + H * W
+        if middle_end <= seq_len:
+            selected_feature = cnn_feature[:, middle_start:middle_end, :]
+        else:
+            selected_feature = cnn_feature[:, :H*W, :]
+        
+        cnn_spatial = selected_feature.transpose(1, 2).reshape(bs, dim, H, W)
+        
+        return cnn_spatial
+
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
