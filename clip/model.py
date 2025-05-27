@@ -744,10 +744,18 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, H, W, require_all_fts=False):
-        f_x, f_attn = self.visual(image.type(self.dtype), H, W, require_all_fts=require_all_fts)
-        # f = self.visual(image.type(self.dtype), H, W, require_all_fts=require_all_fts)
-        return f_x, f_attn
+    def encode_image(self, image, H, W, require_all_fts=True):
+        # VisionTransformer의 forward 메서드 호출
+        outputs = self.visual(image.type(self.dtype), H, W, require_all_fts=require_all_fts)
+        
+        if require_all_fts:
+            # 모든 feature map과 attention weights 반환
+            last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs = outputs
+            return last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights, mrfp_outputs
+        else:
+            # 기본 이미지 인코딩 (projection이 적용된 클래스 토큰)
+            image_features, _ = outputs
+            return image_features, None
     
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
