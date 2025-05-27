@@ -571,38 +571,32 @@ class VisionTransformer(nn.Module):
         f3 = self.norm3(c3_new)
         f4 = self.norm4(c4_new)
         
-        # 8개의 CTI 출력을 channel-wise concat하고 1x1 convolution 적용
-        # 모든 CTI 출력을 H//16 x W//16 크기로 표준화
-        standardized_cti_outputs = []
-        target_dtype = self.final_conv.weight.dtype
-        
-        for cti_output in cti_outputs:
-            if cti_output is not None:
-                # 데이터 타입 통일
-                cti_output = cti_output.to(target_dtype)
-                
-                # 크기를 H//16 x W//16으로 표준화
-                if cti_output.shape[2:] != (H//16, W//16):
-                    cti_output = F.interpolate(cti_output, size=(H//16, W//16), mode='bilinear', align_corners=False)
-                
-                standardized_cti_outputs.append(cti_output)
-        
-        # CTI 출력을 channel-wise concat
-        concat_cti = torch.cat(standardized_cti_outputs, dim=1)  # N x (C) x H x W
-        
-        # 1x1 convolution 적용
-        final_cti = self.final_conv(concat_cti)  # N x C x H//16 x W//16
+        # CTI 출력 처리
+        # 마지막 stage의 CTIBlock에서만 extra_CTI가 True이므로, 해당 출력만 처리
+        final_cti = None
+        for i, (start_block, end_block) in enumerate(self.stage_indices):
+            if i == len(self.stage_indices) - 1:  # 마지막 stage
+                # extra_CTI가 True인 경우에만 channel-wise concatenate 수행
+                if self.interactions[i].extra_CTIs is not None:
+                    # CTI 출력을 spatial 형태로 변환
+                    vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
+                    cnn_spatial = self._convert_cnn_to_spatial(stage_cnn_output, H//16, W//16, bs, dim)
+                    
+                    # channel-wise concatenate
+                    concat_cti = torch.cat([vit_spatial, cnn_spatial], dim=1)
+                    final_cti = self.final_conv(concat_cti)
+                else:
+                    # extra_CTI가 없는 경우 바로 1x1 convolution 적용
+                    vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
+                    final_cti = self.final_conv(vit_spatial)
 
         if require_all_fts:
             # 11번째 transformer block (index 10)의 output
-            # transformer_features의 마지막 요소가 11번째 블록 (Stage 3의 마지막 블록)의 출력
             last_transformer_output = transformer_features[-1] if transformer_features else current_vit
             
             print(f"Total transformer blocks processed: {len(transformer_features)}")
             print(f"Last transformer block (11th) output shape: {last_transformer_output.shape}")
             
-            # transformer features, attention weights, multi-level CNN features, final CTI output, MRFP outputs 반환
-            # 첫 번째 반환값을 11번째 블록의 출력으로 설정 (Grad-CAM용)
             return last_transformer_output, transformer_features, [f1, f2, f3, f4], final_cti, attn_weights, mrfp_outputs
 
         else:
