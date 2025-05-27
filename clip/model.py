@@ -865,7 +865,9 @@ def build_model(state_dict: dict):
             model.visual.norm1,  # Normalization layers
             model.visual.norm2,
             model.visual.norm3,
-            model.visual.norm4
+            model.visual.norm4,
+            model.visual.level_embed,  # Level embedding for multi-level features
+            model.visual.mrfp_weights  # MRFP weights for feature integration
         ]
         
         for module in learnable_modules:
