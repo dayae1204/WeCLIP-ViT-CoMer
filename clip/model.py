@@ -485,17 +485,17 @@ class VisionTransformer(nn.Module):
         for stage_idx, (start_block, end_block) in enumerate(self.stage_indices):
             print(f"Stage {stage_idx}: ViT shape {current_vit.shape}, CNN shape {current_cnn.shape}")
             
-            # 클래스 토큰 제거는 첫 번째 stage에서만
-            if stage_idx == 0:
-                vit_input = current_vit[1:]
-            else:
-                vit_input = current_vit
+            # # 클래스 토큰 제거는 첫 번째 stage에서만 -> comer_moudles에서 처리
+            # if stage_idx == 0:
+            #     vit_input = current_vit[1:]
+            # else:
+            #     vit_input = current_vit
             
             # 간단한 슬라이싱으로 stage_blocks 생성
             stage_blocks = self.transformer.resblocks[start_block:end_block + 1]
             
             stage_vit_output, stage_cnn_output, stage_attn_weights = self.interactions[stage_idx](
-                x=vit_input.permute(1, 0, 2),
+                x=current_vit.permute(1, 0, 2),
                 c=current_cnn, 
                 blocks=stage_blocks,  # 슬라이싱으로 생성된 블록들
                 deform_inputs1=deform_inputs1, 

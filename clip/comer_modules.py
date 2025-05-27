@@ -404,6 +404,11 @@ class CTIBlock(nn.Module):
     def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
         B, N, C = x.shape
         deform_inputs = deform_inputs_only_one(x, H*16, W*16)
+        
+        # class token 저장
+        cls_token = x[0:1]
+        x = x[1:]  # class token 제거
+        
         if self.use_CTI_toV:
             c = self.mrfp(c, H, W)
             c_select1, c_select2, c_select3 = c[:,:H*W*4, :], c[:, H*W*4:H*W*4+H*W, :], c[:, H*W*4+H*W:, :]
@@ -418,13 +423,19 @@ class CTIBlock(nn.Module):
 
         collected_attn_weights = []
         for idx, blk in enumerate(blocks):
+            # transformer block 처리 전에 class token 다시 추가
+            x_with_cls = torch.cat([cls_token, x], dim=0)
             # WeCLIP transformer block은 (L, N, C) 입력과 하나의 출력만 받음
-            x, attn_weight = blk(x)  # attention weight 수집
+            x_with_cls, attn_weight = blk(x_with_cls)  # attention weight 수집
+            # transformer block 처리 후 class token 다시 제거
+            cls_token = x_with_cls[0:1]
+            x = x_with_cls[1:]
             collected_attn_weights.append(attn_weight)
 
         if self.use_CTI_toC:
             if self.adapter is not None:
                 c = self.adapter(c)
+                c = c[:, 1:, :] #class token 제거
             c = self.cti_toc(query=c, reference_points=deform_inputs2[0],
                            feat=x, spatial_shapes=deform_inputs2[1],
                            level_start_index=deform_inputs2[2], H=H, W=W)
@@ -434,6 +445,10 @@ class CTIBlock(nn.Module):
                 c = cti(query=c, reference_points=deform_inputs2[0],
                               feat=x, spatial_shapes=deform_inputs2[1],
                               level_start_index=deform_inputs2[2], H=H, W=W)
+        
+        # class token 다시 추가
+        x = torch.cat([cls_token, x], dim=0)
+        
         return x, c, collected_attn_weights
 
 
