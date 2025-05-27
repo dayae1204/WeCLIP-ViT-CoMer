@@ -418,10 +418,8 @@ class CTIBlock(nn.Module):
                           feat=c, spatial_shapes=deform_inputs[1],
                           level_start_index=deform_inputs[2], H=H, W=W)
 
-        # for idx, blk in enumerate(blocks):
-        #     x = blk(x, H, W)
-
         collected_attn_weights = []
+        last_transformer_output = None
         for idx, blk in enumerate(blocks):
             # transformer block 처리 전에 class token 다시 추가
             x_with_cls = torch.cat([cls_token, x], dim=0)
@@ -431,6 +429,9 @@ class CTIBlock(nn.Module):
             cls_token = x_with_cls[0:1]
             x = x_with_cls[1:]
             collected_attn_weights.append(attn_weight)
+            # 마지막 transformer block의 출력 저장
+            if idx == len(blocks) - 1:
+                last_transformer_output = x_with_cls
 
         if self.use_CTI_toC:
             if self.adapter is not None:
@@ -446,10 +447,10 @@ class CTIBlock(nn.Module):
                               feat=x, spatial_shapes=deform_inputs2[1],
                               level_start_index=deform_inputs2[2], H=H, W=W)
         
-        # class token 다시 추가
+        # 최종 출력에 class token 추가
         x = torch.cat([cls_token, x], dim=0)
         
-        return x, c, collected_attn_weights
+        return x, c, collected_attn_weights, last_transformer_output
 
 
 class CNN(nn.Module):

@@ -514,11 +514,14 @@ class VisionTransformer(nn.Module):
             for block_idx in range(start_block, end_block + 1):
                 # 해당 stage의 마지막 블록인 경우 실제 stage_vit_output 사용
                 if block_idx == end_block:
-                    transformer_features.append(stage_vit_output.permute(1, 0, 2))  # LND format
+                    # CTIBlock에서 반환된 마지막 transformer block 출력 사용
+                    _, _, _, last_transformer_output = stage_vit_output
+                    transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
                 else:
                     # 중간 블록들은 CTIBlock 내부에서 처리되므로 stage 출력을 근사값으로 사용
                     # 실제로는 CTIBlock에서 개별 출력을 받아야 하지만, 현재 구조에서는 근사
-                    transformer_features.append(stage_vit_output.permute(1, 0, 2))  # LND format
+                    _, _, _, last_transformer_output = stage_vit_output
+                    transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
             
             # CTI 출력 저장 (ViT branch용과 CNN branch용)
             # ViT와 CNN 출력을 spatial 형태로 변환하여 저장
