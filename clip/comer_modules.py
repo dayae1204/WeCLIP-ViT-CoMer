@@ -404,17 +404,19 @@ class CTIBlock(nn.Module):
     def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
         B, N, C = x.shape
 
-        # class token 저장
-        cls_token = x[0:1]
-        x = x[1:]  # class token 제거
+        # class token 저장 (permute된 상태에서 처리)
+        cls_token = x[:, 0:1, :]  # [B, 1, C]
+        x = x[:, 1:, :]  # class token 제거 [B, N-1, C]
 
         deform_inputs = deform_inputs_only_one(x, H*16, W*16)
-    
         
         if self.use_CTI_toV:
             c = self.mrfp(c, H, W)
-            c_select1, c_select2, c_select3 = c[:,:H*W*4, :], c[:, H*W*4:H*W*4+H*W, :], c[:, H*W*4+H*W:, :]
-            # x의 크기가 400이므로 c_select2와 더할 때 크기가 맞도록 조정
+            # c_select2의 크기가 x와 일치하는지 확인
+            c_select1 = c[:, :H*W*4, :]
+            c_select2 = c[:, H*W*4:H*W*4+H*W, :]
+            c_select3 = c[:, H*W*4+H*W:, :]
+            
             c = torch.cat([c_select1, c_select2 + x, c_select3], dim=1)
 
             x = self.cti_tov(query=x, reference_points=deform_inputs[0],
@@ -425,12 +427,12 @@ class CTIBlock(nn.Module):
         last_transformer_output = None
         for idx, blk in enumerate(blocks):
             # transformer block 처리 전에 class token 다시 추가
-            x_with_cls = torch.cat([cls_token, x], dim=0)
+            x_with_cls = torch.cat([cls_token, x], dim=1)  # [B, N, C]
             # WeCLIP transformer block은 (L, N, C) 입력과 하나의 출력만 받음
             x_with_cls, attn_weight = blk(x_with_cls)  # attention weight 수집
             # transformer block 처리 후 class token 다시 제거
-            cls_token = x_with_cls[0:1]
-            x = x_with_cls[1:]
+            cls_token = x_with_cls[:, 0:1, :]
+            x = x_with_cls[:, 1:, :]
             collected_attn_weights.append(attn_weight)
             # 마지막 transformer block의 출력 저장
             if idx == len(blocks) - 1:
@@ -439,7 +441,6 @@ class CTIBlock(nn.Module):
         if self.use_CTI_toC:
             if self.adapter is not None:
                 c = self.adapter(c)
-                c = c[:, 1:, :] #class token 제거
             c = self.cti_toc(query=c, reference_points=deform_inputs2[0],
                            feat=x, spatial_shapes=deform_inputs2[1],
                            level_start_index=deform_inputs2[2], H=H, W=W)
@@ -451,7 +452,7 @@ class CTIBlock(nn.Module):
                               level_start_index=deform_inputs2[2], H=H, W=W)
         
         # 최종 출력에 class token 추가
-        x = torch.cat([cls_token, x], dim=0)
+        x = torch.cat([cls_token, x], dim=1)
         
         return x, c, collected_attn_weights, last_transformer_output
 
