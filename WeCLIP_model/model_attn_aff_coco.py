@@ -68,10 +68,9 @@ class WeCLIP(nn.Module):
         self.decoder = DecoderTransformer(width=self.embedding_dim, layers=3, heads=8, output_dim=self.num_classes)
 
         self.bg_text_features = zeroshot_classifier(BACKGROUND_CATEGORY_COCO, ['a clean origami {}.'],
-                                               self.encoder)  # ['a rendering of a weird {}.'], model)
+                                               self.encoder)
         self.fg_text_features = zeroshot_classifier(new_class_names_coco, ['a clean origami {}.'],
-                                               self.encoder)  # ['a rendering of a weird {}.'], model) (20, 512)
-
+                                               self.encoder)
 
         self.target_layers = [self.encoder.visual.transformer.resblocks[-1].ln_1]
         self.grad_cam = GradCAM(model=self.encoder, target_layers=self.target_layers, reshape_transform=reshape_transform)
@@ -84,20 +83,8 @@ class WeCLIP(nn.Module):
         self.iter_num = 0
         self.require_all_fts = True
 
-
-    # def get_param_groups(self):
-
-    #     param_groups = [[], [], [], []]  # backbone; backbone_norm; cls_head; seg_head;
-
-    #     for param in list(self.decoder.parameters()):
-    #         param_groups[3].append(param)
-    #     for param in list(self.decoder_fts_fuse.parameters()):
-    #         param_groups[3].append(param)
-
-    #     return param_groups
-    
     def get_param_groups(self):
-        # backbone; backbone_norm; cls_head; seg_head; comer_modules;
+        # backbone; backbone_norm; cls_head; seg_head; learnable_params;
         param_groups = [[], [], [], [], []]  
 
         # 기존 decoder 파라미터
@@ -106,53 +93,54 @@ class WeCLIP(nn.Module):
         for param in list(self.decoder_fts_fuse.parameters()):
             param_groups[3].append(param)
         
-        # ViT-Comer 관련 파라미터 추가 (param_groups[4]에 저장)
+        # ViT-CoMer 관련 파라미터 추가 (param_groups[4]에 저장)
         
-        # CNN backbone (SPM) 파라미터
+        # CNN backbone (SPM) 파라미터 - learnable
         for param in list(self.encoder.visual.spm.parameters()):
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
         
-        # MRFP 모듈 파라미터
+        # MRFP 모듈 파라미터 - learnable
         for module in self.encoder.visual.mrfp_modules:
             for param in module.parameters():
-                param_groups[4].append(param)
+                if param.requires_grad:
+                    param_groups[4].append(param)
         
-        # CTI_toV 모듈 파라미터
-        for module in self.encoder.visual.cti_to_v_modules:
+        # CTI interactions (CTIBlock) 파라미터 - learnable
+        for module in self.encoder.visual.interactions:
             for param in module.parameters():
-                param_groups[4].append(param)
+                if param.requires_grad:
+                    param_groups[4].append(param)
         
-        # CTI_toC 모듈 파라미터
-        for module in self.encoder.visual.cti_to_c_modules:
-            for param in module.parameters():
-                param_groups[4].append(param)
-        
-        # # Adapter 모듈 파라미터
-        # for adapter in self.encoder.visual.adapters_to_v:
-        #     for param in adapter.parameters():
-        #         param_groups[4].append(param)
-        
+        # Adapter 모듈 파라미터 - learnable
         for adapter in self.encoder.visual.adapters_to_c:
             for param in adapter.parameters():
+                if param.requires_grad:
+                    param_groups[4].append(param)
+        
+        # Final Conv 파라미터 - learnable
+        for param in self.encoder.visual.final_conv.parameters():
+            if param.requires_grad:
                 param_groups[4].append(param)
         
-        # Final Conv 파라미터
-        for param in self.encoder.visual.final_conv.parameters():
-            param_groups[4].append(param)
-        
-        # Normalization 레이어 파라미터
+        # Normalization 레이어 파라미터 - learnable
         for param in self.encoder.visual.norm1.parameters():
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
         for param in self.encoder.visual.norm2.parameters():
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
         for param in self.encoder.visual.norm3.parameters():
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
         for param in self.encoder.visual.norm4.parameters():
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
         
-        # Upsampling 레이어 파라미터
+        # Upsampling 레이어 파라미터 - learnable
         for param in self.encoder.visual.up.parameters():
-            param_groups[4].append(param)
+            if param.requires_grad:
+                param_groups[4].append(param)
 
         return param_groups
 
@@ -164,35 +152,23 @@ class WeCLIP(nn.Module):
         b, c, h, w = img.shape
         self.iter_num += 1
 
-        # ViT-Comer 모델 실행 - 8개의 CTI 출력을 포함한 결과 받기
-        last_vit_output, transformer_features, cti_outputs, multi_level_features, final_cti, attn_weight_list, mrfp_outputs = self.encoder.visual(
-            img, h, w, require_all_fts=True)
+        # ViT-CoMer 모델 실행
+        last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weight_list = self.encoder.visual(
+            img, h, w, require_all_fts=self.require_all_fts)
         
         # attention weight 처리
         attn_weight_stack = torch.stack(attn_weight_list, dim=0).permute(1, 0, 2, 3)
         
+        # CAM 관련 처리
+        cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)
 
-        # CAM 관련 처리 - last_vit_output 사용
-        if self.require_all_fts == True:
-            cam_fts_all = last_vit_output.unsqueeze(0).permute(2, 1, 0, 3)
-        else:
-            fts_all_stack = torch.stack(transformer_features, dim=0)
-            cam_fts_all = fts_all_stack.permute(2, 1, 0, 3)
-
-        # 기존:
-        # all_img_tokens = fts_all_stack[:, 1:, ...]
-        # all_img_tokens = all_img_tokens.reshape(-1, b, img_tokens_channel, h // 16, w // 16)
-        # fts = self.decoder_fts_fuse(all_img_tokens)
-        # seg, seg_attn_weight_list = self.decoder(fts)
-
-        # 중요 변경: final_cti를 수정된 decoder_fts_fuse에 바로 전달
-        # SegFormerHead가 단일 텐서 처리를 위해 수정됨
+        # final_cti를 decoder_fts_fuse에 전달
         fts = self.decoder_fts_fuse(final_cti)
         
         # decoder에 변환된 feature map 전달
         seg, seg_attn_weight_list = self.decoder(fts)
         
-        # affinity map 생성에도 변환된 feature map 사용
+        # affinity map 생성
         attn_fts = fts.clone()  # 256 채널 텐서
         f_b, f_c, f_h, f_w = attn_fts.shape
         attn_fts_flatten = attn_fts.reshape(f_b, f_c, f_h*f_w)
@@ -209,7 +185,7 @@ class WeCLIP(nn.Module):
             cam_attn = attn_weight_stack[i]
             seg_attn = attn_pred.unsqueeze(0)[:, i, :, :]
 
-            if self.iter_num > 40000 or mode=='val': #40000
+            if self.iter_num > 40000 or mode=='val':
                 require_seg_trans = True
             else:
                 require_seg_trans = False
@@ -236,6 +212,5 @@ class WeCLIP(nn.Module):
             cam_list.append(cam_labels)
 
         all_cam_labels = torch.stack(cam_list, dim=0)
-
 
         return seg, all_cam_labels, attn_pred

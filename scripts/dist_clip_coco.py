@@ -139,7 +139,6 @@ def get_mask_by_radius(h=20, w=20, radius=8):
 
 
 def train(cfg):
-
     num_workers = 10
     
     time0 = datetime.datetime.now()
@@ -184,7 +183,6 @@ def train(cfg):
                             pin_memory=False,
                             drop_last=False)
 
-
     WeCLIP_model = WeCLIP(
         num_classes=cfg.dataset.num_classes,
         clip_model=cfg.clip_init.clip_pretrain_path,
@@ -195,100 +193,58 @@ def train(cfg):
     )
     logging.info('\nNetwork config: \n%s'%(WeCLIP_model))
     
-    # 기존 파라미터 그룹 (backbone, backbone_norm, cls_head, seg_head)
+    # 파라미터 그룹 설정
     param_groups = WeCLIP_model.get_param_groups()
-
     WeCLIP_model.cuda()
 
     mask_size = int(cfg.dataset.crop_size // 16)
     attn_mask = get_mask_by_radius(h=mask_size, w=mask_size, radius=args.radius)
     writer = SummaryWriter(cfg.work_dir.tb_logger_dir)
 
-    # ViT-Comer를 위한 새 파라미터 그룹이 있는지 확인하고 처리
-    if len(param_groups) > 4:
-        comer_params = param_groups[4]
-        
-        # optimizer 설정
-        optimizer = PolyWarmupAdamW(
-            params=[
-                {
-                    "params": param_groups[0],
-                    "lr": cfg.optimizer.learning_rate,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-                {
-                    "params": param_groups[1],
-                    "lr": 0.0,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "params": param_groups[2],
-                    "lr": cfg.optimizer.learning_rate*10,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-                {
-                    "params": param_groups[3],
-                    "lr": cfg.optimizer.learning_rate*10,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-                # ViT-Comer 모듈을 위한 새 파라미터 그룹 추가
-                {
-                    "params": param_groups[4],
-                    "lr": cfg.optimizer.learning_rate*5,  # 기본 학습률의 5배 (조정 가능)
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-            ],
-            lr = cfg.optimizer.learning_rate,
-            weight_decay = cfg.optimizer.weight_decay,
-            betas = cfg.optimizer.betas,
-            warmup_iter = cfg.scheduler.warmup_iter,
-            max_iter = cfg.train.max_iters,
-            warmup_ratio = cfg.scheduler.warmup_ratio,
-            power = cfg.scheduler.power
-        )
-
-    else:
-        # 기존 optimizer 설정 (변경 없음)
-        optimizer = PolyWarmupAdamW(
-            params=[
-                {
-                    "params": param_groups[0],
-                    "lr": cfg.optimizer.learning_rate,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-                {
-                    "params": param_groups[1],
-                    "lr": 0.0,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "params": param_groups[2],
-                    "lr": cfg.optimizer.learning_rate*10,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-                {
-                    "params": param_groups[3],
-                    "lr": cfg.optimizer.learning_rate*10,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                },
-            ],
-            lr = cfg.optimizer.learning_rate,
-            weight_decay = cfg.optimizer.weight_decay,
-            betas = cfg.optimizer.betas,
-            warmup_iter = cfg.scheduler.warmup_iter,
-            max_iter = cfg.train.max_iters,
-            warmup_ratio = cfg.scheduler.warmup_ratio,
-            power = cfg.scheduler.power
-        )
+    # optimizer 설정
+    optimizer = PolyWarmupAdamW(
+        params=[
+            {
+                "params": param_groups[0],
+                "lr": cfg.optimizer.learning_rate,
+                "weight_decay": cfg.optimizer.weight_decay,
+            },
+            {
+                "params": param_groups[1],
+                "lr": 0.0,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": param_groups[2],
+                "lr": cfg.optimizer.learning_rate*10,
+                "weight_decay": cfg.optimizer.weight_decay,
+            },
+            {
+                "params": param_groups[3],
+                "lr": cfg.optimizer.learning_rate*10,
+                "weight_decay": cfg.optimizer.weight_decay,
+            },
+            {
+                "params": param_groups[4],  # learnable_params (ViT-CoMer)
+                "lr": cfg.optimizer.learning_rate*5,
+                "weight_decay": cfg.optimizer.weight_decay,
+            },
+        ],
+        lr = cfg.optimizer.learning_rate,
+        weight_decay = cfg.optimizer.weight_decay,
+        betas = cfg.optimizer.betas,
+        warmup_iter = cfg.scheduler.warmup_iter,
+        max_iter = cfg.train.max_iters,
+        warmup_ratio = cfg.scheduler.warmup_ratio,
+        power = cfg.scheduler.power
+    )
     logging.info('\nOptimizer: \n%s' % optimizer)
 
     train_loader_iter = iter(train_loader)
-
     avg_meter = AverageMeter()
-
+    best_score = 0.0
 
     for n_iter in range(cfg.train.max_iters):
-        
         try:
             img_name, inputs, cls_labels, img_box = next(train_loader_iter)
         except:
@@ -317,7 +273,6 @@ def train(cfg):
         optimizer.step()
         
         if (n_iter + 1) % cfg.train.log_iters == 0:
-            
             delta, eta = cal_eta(time0, n_iter+1, cfg.train.max_iters)
             cur_lr = optimizer.param_groups[0]['lr']
 
@@ -325,7 +280,6 @@ def train(cfg):
             gts = pseudo_label.cpu().numpy().astype(np.int16)
 
             seg_mAcc = (preds==gts).sum()/preds.size
-
 
             logging.info("Iter: %d; Elasped: %s; ETA: %s; LR: %.3e;, pseudo_seg_loss: %.4f, attn_loss: %.4f, pseudo_seg_mAcc: %.4f"%(n_iter+1, delta, eta, cur_lr, avg_meter.pop('seg_loss'), avg_meter.pop('attn_loss'), seg_mAcc))
 
