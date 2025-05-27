@@ -909,6 +909,12 @@ def save_learnable_weights(model, path):
             if param.requires_grad:
                 state_dict[f'visual.interactions.{i}.{name}'] = param
     
+    # Adapter weights - 새로 추가된 모듈
+    for i, adapter in enumerate(model.visual.adapters_to_c):
+        for name, param in adapter.named_parameters():
+            if param.requires_grad:
+                state_dict[f'visual.adapters_to_c.{i}.{name}'] = param
+    
     # Final conv weights - 새로 추가된 모듈
     for name, param in model.visual.final_conv.named_parameters():
         if param.requires_grad:
@@ -936,7 +942,11 @@ def save_learnable_weights(model, path):
             if weight.requires_grad:
                 state_dict[f'visual.mrfp_weights.{i}'] = weight
     
+    # 저장할 파라미터 수 출력
+    total_params = sum(p.numel() for p in state_dict.values())
     print(f"Saving {len(state_dict)} learnable parameters (ViT-CoMer modules only)")
+    print(f"Total number of learnable parameters: {total_params:,}")
+    
     torch.save(state_dict, path)
 
 def load_learnable_weights(model, path):
@@ -946,10 +956,16 @@ def load_learnable_weights(model, path):
     # strict=False로 설정하여 일치하지 않는 키는 무시
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
+    # 로딩된 파라미터 정보 출력
+    total_params = sum(p.numel() for p in state_dict.values())
     print(f"Loaded {len(state_dict)} learnable parameters")
+    print(f"Total number of loaded parameters: {total_params:,}")
+    
     if missing_keys:
         print(f"Missing keys: {len(missing_keys)} (expected for pretrained weights)")
+        print("First few missing keys:", missing_keys[:5])
     if unexpected_keys:
         print(f"Unexpected keys: {len(unexpected_keys)}")
+        print("First few unexpected keys:", unexpected_keys[:5])
     
     return model
