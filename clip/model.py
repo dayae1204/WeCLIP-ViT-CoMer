@@ -551,30 +551,30 @@ class VisionTransformer(nn.Module):
         f3 = self.norm3(c3_new)
         f4 = self.norm4(c4_new)
         
-        # CTI 출력 처리
-        # 마지막 stage의 CTIBlock에서만 extra_CTI가 True이므로, 해당 출력만 처리
-        final_cti = None
-        for i, (start_block, end_block) in enumerate(self.stage_indices):
-            if i == len(self.stage_indices) - 1:  # 마지막 stage
-                # extra_CTI가 True인 경우에만 channel-wise concatenate 수행
-                if self.interactions[i].extra_CTIs is not None:
-                    # CTI 출력을 spatial 형태로 변환
-                    vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
-                    cnn_spatial = self._convert_cnn_to_spatial(stage_cnn_output, H//16, W//16, bs, dim)
+        # # CTI 출력 처리
+        # # 마지막 stage의 CTIBlock에서만 extra_CTI가 True이므로, 해당 출력만 처리
+        # final_cti = None
+        # for i, (start_block, end_block) in enumerate(self.stage_indices):
+        #     if i == len(self.stage_indices) - 1:  # 마지막 stage
+        #         # extra_CTI가 True인 경우에만 channel-wise concatenate 수행
+        #         if self.interactions[i].extra_CTIs is not None:
+        #             # CTI 출력을 spatial 형태로 변환
+        #             vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
+        #             cnn_spatial = self._convert_cnn_to_spatial(stage_cnn_output, H//16, W//16, bs, dim)
                     
-                    # channel-wise concatenate
-                    concat_cti = torch.cat([vit_spatial, cnn_spatial], dim=1)
-                    final_cti = self.final_conv(concat_cti)
-                else:
-                    # extra_CTI가 없는 경우 바로 1x1 convolution 적용
-                    vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
-                    final_cti = self.final_conv(vit_spatial)
+        #             # channel-wise concatenate
+        #             concat_cti = torch.cat([vit_spatial, cnn_spatial], dim=1)
+        #             final_cti = self.final_conv(concat_cti)
+        #         else:
+        #             # extra_CTI가 없는 경우 바로 1x1 convolution 적용
+        #             vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
+        #             final_cti = self.final_conv(vit_spatial)
 
         if require_all_fts:
             # 11번째 transformer block (index 10)의 output
             last_transformer_output = transformer_features[-1] if transformer_features else current_vit
             
-            return last_transformer_output, transformer_features, [f1, f2, f3, f4], final_cti, attn_weights
+            return last_transformer_output, transformer_features, [f1, f2, f3, f4], cti_outputs, attn_weights
 
         else:
             # 기존 VisionTransformer의 출력 형태 유지
@@ -724,8 +724,8 @@ class CLIP(nn.Module):
     def encode_image(self, image, H, W, require_all_fts=False):
         if require_all_fts:
             outputs = self.visual(image, H, W, require_all_fts=True)
-            last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights = outputs
-            return last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weights
+            last_transformer_output, transformer_features, multi_level_features, cti_outputs, attn_weights = outputs
+            return last_transformer_output, transformer_features, multi_level_features, cti_outputs, attn_weights
         else:
             image_features, _ = self.visual(image, H, W, require_all_fts=False)
             return image_features, None
@@ -770,10 +770,10 @@ class CLIP(nn.Module):
         return logits_per_image, attn_weight
 
     def forward(self, image, text):
-        image_features, transformer_features, multi_level_features, final_cti, attn_weights = self.encode_image(image, image.shape[2], image.shape[3], require_all_fts=True)
+        image_features, transformer_features, multi_level_features, cti_outputs, attn_weights = self.encode_image(image, image.shape[2], image.shape[3], require_all_fts=True)
         with torch.no_grad():
             text_features = self.encode_text(text)
-        return image_features, transformer_features, multi_level_features, final_cti, attn_weights
+        return image_features, transformer_features, multi_level_features, cti_outputs, attn_weights
 
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
