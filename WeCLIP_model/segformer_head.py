@@ -82,7 +82,7 @@ class Conv_Linear(nn.Module):
 class SegFormerHead(nn.Module):
     """
     SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers
-    - 수정: 단일 텐서(final_cti)도 처리할 수 있도록 변경
+    - 수정: 단일 텐서(extra_cti_vit)도 처리할 수 있도록 변경
     """
     def __init__(self, in_channels=128, embedding_dim=256, num_classes=20, index=11, **kwargs):
         super(SegFormerHead, self).__init__()
@@ -98,16 +98,19 @@ class SegFormerHead(nn.Module):
         
         self.linear_fuse = nn.Conv2d(embedding_dim*self.indexes, embedding_dim, kernel_size=1)
         
-        # 추가: 단일 텐서(final_cti)를 처리하기 위한 1x1 convolution
+        # 추가: 단일 텐서(extra_cti_vit)를 처리하기 위한 1x1 convolution
         self.cti_reducer = nn.Conv2d(768, embedding_dim, kernel_size=1)
         
         self.dropout = nn.Dropout2d(0.1)
         
     def forward(self, x_all):
-        # final_cti가 단일 텐서로 들어왔는지 확인
-        if len(x_all.shape) == 4:  # 단일 텐서 [N, C, H, W]
-            # final_cti 직접 처리
-            x = self.cti_reducer(x_all)
+        # Extra_CTI outputs 처리
+        if isinstance(x_all, list) and len(x_all) == 8:  # CTI outputs list
+            # Stage 3의 ViT output (index 6) 추출
+            extra_cti_vit = x_all[6]  # Stage 3의 ViT output
+            
+            # Extra_CTI의 ViT output을 self.cti_reducer에 입력
+            x = self.cti_reducer(extra_cti_vit)
             x = self.dropout(x)
             return x
         

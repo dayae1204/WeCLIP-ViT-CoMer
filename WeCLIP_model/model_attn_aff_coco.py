@@ -153,7 +153,7 @@ class WeCLIP(nn.Module):
         self.iter_num += 1
 
         # ViT-CoMer 모델 실행
-        last_transformer_output, transformer_features, multi_level_features, final_cti, attn_weight_list = self.encoder.visual(
+        last_transformer_output, transformer_features, multi_level_features, cti_outputs, attn_weight_list = self.encoder.visual(
             img, h, w, require_all_fts=self.require_all_fts)
         
         # attention weight 처리
@@ -162,8 +162,8 @@ class WeCLIP(nn.Module):
         # CAM 관련 처리
         cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)
 
-        # final_cti를 decoder_fts_fuse에 전달
-        fts = self.decoder_fts_fuse(final_cti)
+        # cti_outputs를 decoder_fts_fuse에 전달
+        fts = self.decoder_fts_fuse(cti_outputs)
         
         # decoder에 변환된 feature map 전달
         seg, seg_attn_weight_list = self.decoder(fts)
