@@ -152,15 +152,15 @@ class WeCLIP(nn.Module):
         b, c, h, w = img.shape
         self.iter_num += 1
 
-        # ViT-CoMer 모델 실행
+        # CLIP + ViT-CoMer encoder forward
         last_transformer_output, transformer_features, multi_level_features, cti_outputs, attn_weight_list = self.encoder.visual(
             img, h, w, require_all_fts=self.require_all_fts)
         
         # attention weight 처리
         attn_weight_stack = torch.stack(attn_weight_list, dim=0).permute(1, 0, 2, 3)
         
-        # CAM 관련 처리
-        cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)
+        # Input for Grad-CAM
+        cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)  # (b, hw, 1, c)
 
         # cti_outputs를 decoder_fts_fuse에 전달
         fts = self.decoder_fts_fuse(cti_outputs)
@@ -168,8 +168,8 @@ class WeCLIP(nn.Module):
         # decoder에 변환된 feature map 전달
         seg, seg_attn_weight_list = self.decoder(fts)
         
-        # affinity map 생성
-        attn_fts = fts.clone()  # 256 채널 텐서
+        # Generate affinity map
+        attn_fts = fts.clone()  # 256 channel
         f_b, f_c, f_h, f_w = attn_fts.shape
         attn_fts_flatten = attn_fts.reshape(f_b, f_c, f_h*f_w)
         attn_pred = attn_fts_flatten.transpose(2, 1).bmm(attn_fts_flatten)

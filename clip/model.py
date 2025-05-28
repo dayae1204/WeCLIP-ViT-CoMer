@@ -333,6 +333,9 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(width, layers, heads)
         self.patch_size = patch_size
         
+        # projection layer 추가
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        
         # ViT-Comer에서 추가된 부분
         self.pretrain_size = (input_resolution, input_resolution)
         
@@ -488,6 +491,7 @@ class VisionTransformer(nn.Module):
 
             # CTIBlock에서 수집한 attention weights 추가
             attn_weights.extend(stage_attn_weights)
+            # print(f'stage_attn_weights length: {len(stage_attn_weights)} | shape: {stage_attn_weights[0].shape}')
 
             # CTIBlock에서 나온 결과를 다음 stage의 입력으로 사용
             current_vit = stage_vit_output.permute(1, 0, 2)  # NLD -> LND
@@ -497,10 +501,10 @@ class VisionTransformer(nn.Module):
             for block_idx in range(start_block, end_block + 1):
                 # 해당 stage의 마지막 블록인 경우 실제 stage_vit_output 사용
                 if block_idx == end_block:
-                    transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
+                    transformer_features.append(last_transformer_output)  # LND
                 else:
                     # 중간 블록들은 CTIBlock 내부에서 처리되므로 stage 출력을 근사값으로 사용
-                    transformer_features.append(last_transformer_output.permute(1, 0, 2))  # LND format
+                    transformer_features.append(last_transformer_output)  # LND
             
             # CTI 출력 저장 (ViT branch용과 CNN branch용)
             # ViT와 CNN 출력을 spatial 형태로 변환하여 저장
@@ -529,8 +533,8 @@ class VisionTransformer(nn.Module):
         # transformer_features에서 각 stage의 마지막 transformer block 출력 사용
         vit_spatial_features = []
         for i in range(0, len(transformer_features), 3):  # 각 stage의 마지막 블록
-            if i + 2 < len(transformer_features):  # stage가 완전한 경우
-                vit_feat = transformer_features[i+2]
+            if i + 1 < len(transformer_features):  # stage가 완전한 경우
+                vit_feat = transformer_features[i+1]
                 vit_spatial = self._convert_vit_to_spatial(vit_feat, H//16, W//16, bs, dim)
                 vit_spatial_features.append(vit_spatial)
         
@@ -581,9 +585,6 @@ class VisionTransformer(nn.Module):
             x_vit = current_vit.permute(1, 0, 2)  # LND -> NLD
             x_vit = self.ln_post(x_vit[:, 0])  # 클래스 토큰만 선택
             
-            if not hasattr(self, 'proj'):
-                scale = self.width ** -0.5
-                self.proj = nn.Parameter(scale * torch.randn(dim, self.output_dim))
             if self.proj is not None:
                 x_vit = x_vit @ self.proj
             
@@ -859,20 +860,23 @@ def build_model(state_dict: dict):
             model.visual.spm,  # CNN backbone
             model.visual.mrfp_modules,  # MRFP modules
             model.visual.interactions,  # CTI interactions
-            model.visual.final_conv,  # Final convolution
             model.visual.up,  # Upsampling layer
             model.visual.adapters_to_c,  # Adapters
             model.visual.norm1,  # Normalization layers
             model.visual.norm2,
             model.visual.norm3,
             model.visual.norm4,
-            model.visual.level_embed,  # Level embedding for multi-level features
-            model.visual.mrfp_weights  # MRFP weights for feature integration
         ]
         
+        # nn.Module 객체들의 파라미터 설정
         for module in learnable_modules:
             for param in module.parameters():
                 param.requires_grad = True
+        
+        # nn.Parameter 객체들은 별도로 처리
+        model.visual.level_embed.requires_grad = True  # Level embedding
+        for weight in model.visual.mrfp_weights:  # MRFP weights
+            weight.requires_grad = True
     
     return model.eval()
 
@@ -919,16 +923,6 @@ def save_learnable_weights(model, path):
         for name, param in norm_layer.named_parameters():
             if param.requires_grad:
                 state_dict[f'visual.norm{i}.{name}'] = param
-    
-    # Level embedding - 새로 추가된 파라미터
-    if hasattr(model.visual, 'level_embed') and model.visual.level_embed.requires_grad:
-        state_dict['visual.level_embed'] = model.visual.level_embed
-    
-    # MRFP weights - 새로 추가된 파라미터
-    if hasattr(model.visual, 'mrfp_weights'):
-        for i, weight in enumerate(model.visual.mrfp_weights):
-            if weight.requires_grad:
-                state_dict[f'visual.mrfp_weights.{i}'] = weight
     
     # 저장할 파라미터 수 출력
     total_params = sum(p.numel() for p in state_dict.values())
