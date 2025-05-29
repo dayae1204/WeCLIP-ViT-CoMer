@@ -62,15 +62,15 @@ class WeCLIP(nn.Module):
         self.encoder, _ = clip.load(clip_model, device=device)
         self.encoder = self.encoder.float()
         self.in_channels = in_channels
-
+        
         self.decoder_fts_fuse = SegFormerHead(in_channels=self.in_channels,embedding_dim=self.embedding_dim,
-                                              num_classes=self.num_classes)
+                                               num_classes=self.num_classes)
         self.decoder = DecoderTransformer(width=self.embedding_dim, layers=3, heads=8, output_dim=self.num_classes)
 
         self.bg_text_features = zeroshot_classifier(BACKGROUND_CATEGORY_COCO, ['a clean origami {}.'],
-                                               self.encoder)
+                                                self.encoder)
         self.fg_text_features = zeroshot_classifier(new_class_names_coco, ['a clean origami {}.'],
-                                               self.encoder)
+                                                self.encoder)
 
         self.target_layers = [self.encoder.visual.transformer.resblocks[-1].ln_1]
         self.grad_cam = GradCAM(model=self.encoder, target_layers=self.target_layers, reshape_transform=reshape_transform)
@@ -99,12 +99,6 @@ class WeCLIP(nn.Module):
         for param in list(self.encoder.visual.spm.parameters()):
             if param.requires_grad:
                 param_groups[4].append(param)
-        
-        # MRFP 모듈 파라미터 - learnable
-        for module in self.encoder.visual.mrfp_modules:
-            for param in module.parameters():
-                if param.requires_grad:
-                    param_groups[4].append(param)
         
         # CTI interactions (CTIBlock) 파라미터 - learnable
         for module in self.encoder.visual.interactions:
@@ -141,9 +135,9 @@ class WeCLIP(nn.Module):
         for param in self.encoder.visual.up.parameters():
             if param.requires_grad:
                 param_groups[4].append(param)
-
+                
         return param_groups
-
+        
     def forward(self, img, img_names, mode='train'):
         # 이미지를 float으로 변환
         img = img.float()
@@ -161,7 +155,7 @@ class WeCLIP(nn.Module):
         
         # Input for Grad-CAM
         cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)  # (b, hw, 1, c)
-
+        
         # cti_outputs를 decoder_fts_fuse에 전달
         fts = self.decoder_fts_fuse(cti_outputs)
         
@@ -212,5 +206,5 @@ class WeCLIP(nn.Module):
             cam_list.append(cam_labels)
 
         all_cam_labels = torch.stack(cam_list, dim=0)
-
+        
         return seg, all_cam_labels, attn_pred

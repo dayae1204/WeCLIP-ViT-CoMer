@@ -351,12 +351,6 @@ class VisionTransformer(nn.Module):
         self.spm = CNN(inplanes=64, embed_dim=width)
         self.level_embed = nn.Parameter(torch.zeros(3, width))
         
-        # MRFP 모듈 (Multi-Resolution Feature Processing)
-        self.mrfp_modules = nn.ModuleList([
-            MRFP(width, hidden_features=int(width * 6.0))
-            for _ in range(len(self.stage_indices))
-        ])
-        
         self.adapters_to_c = nn.ModuleList([
             Adapter(width) for _ in range(len(self.stage_indices))
         ])
@@ -858,7 +852,6 @@ def build_model(state_dict: dict):
         # ViT-CoMer 관련 모듈은 학습 가능하게 설정
         learnable_modules = [
             model.visual.spm,  # CNN backbone
-            model.visual.mrfp_modules,  # MRFP modules
             model.visual.interactions,  # CTI interactions
             model.visual.up,  # Upsampling layer
             model.visual.adapters_to_c,  # Adapters
@@ -888,12 +881,6 @@ def save_learnable_weights(model, path):
     for name, param in model.visual.spm.named_parameters():
         if param.requires_grad:
             state_dict[f'visual.spm.{name}'] = param
-    
-    # MRFP modules weights - 새로 추가된 모듈
-    for i, module in enumerate(model.visual.mrfp_modules):
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                state_dict[f'visual.mrfp_modules.{i}.{name}'] = param
     
     # CTI interactions weights - 새로 추가된 모듈 (CTIBlock, CTI_toV, CTI_toC 포함)
     for i, module in enumerate(model.visual.interactions):
