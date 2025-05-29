@@ -379,7 +379,7 @@ class VisionTransformer(nn.Module):
         self.up = nn.ConvTranspose2d(width, width, 2, 2)
         
         # 8개의 CTI 출력을 channel-wise concat 후 적용할 1x1 convolution
-        self.final_conv = nn.Conv2d(width * 8, width, kernel_size=1)
+        self.final_conv = nn.Conv2d(width * 4, width, kernel_size=1)  # 4개의 feature map을 concat하므로 width * 4
 
         # MRFP 결과를 CNN feature에 통합하기 위한 learnable weights
         self.mrfp_weights = nn.ParameterList([
@@ -549,30 +549,29 @@ class VisionTransformer(nn.Module):
         f3 = self.norm3(c3_new)
         f4 = self.norm4(c4_new)
         
-        # # CTI 출력 처리
-        # # 마지막 stage의 CTIBlock에서만 extra_CTI가 True이므로, 해당 출력만 처리
-        # final_cti = None
-        # for i, (start_block, end_block) in enumerate(self.stage_indices):
-        #     if i == len(self.stage_indices) - 1:  # 마지막 stage
-        #         # extra_CTI가 True인 경우에만 channel-wise concatenate 수행
-        #         if self.interactions[i].extra_CTIs is not None:
-        #             # CTI 출력을 spatial 형태로 변환
-        #             vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
-        #             cnn_spatial = self._convert_cnn_to_spatial(stage_cnn_output, H//16, W//16, bs, dim)
-                    
-        #             # channel-wise concatenate
-        #             concat_cti = torch.cat([vit_spatial, cnn_spatial], dim=1)
-        #             final_cti = self.final_conv(concat_cti)
-        #         else:
-        #             # extra_CTI가 없는 경우 바로 1x1 convolution 적용
-        #             vit_spatial = self._convert_vit_to_spatial(stage_vit_output, H//16, W//16, bs, dim)
-        #             final_cti = self.final_conv(vit_spatial)
+        # Multi-level features를 channel-wise concat
+        features = [f1, f2, f3, f4]
+        
+        # 모든 feature를 f3의 해상도로 resize
+        resized_features = []
+        for feat in features:
+            if feat.shape[2:] != f3.shape[2:]:
+                resized = F.interpolate(feat, size=f3.shape[2:], mode='bilinear', align_corners=False)
+                resized_features.append(resized)
+            else:
+                resized_features.append(feat)
+        
+        # Channel-wise concat
+        concat_features = torch.cat(resized_features, dim=1)  # [B, 768*4, H, W]
+        
+        # 1x1 convolution으로 채널 수 조정
+        final_features = self.final_conv(concat_features)  # [B, 768, H, W]
 
         if require_all_fts:
             # 11번째 transformer block (index 10)의 output
             last_transformer_output = transformer_features[-1] if transformer_features else current_vit
             
-            return last_transformer_output, transformer_features, [f1, f2, f3, f4], cti_outputs, attn_weights
+            return last_transformer_output, transformer_features, final_features, cti_outputs, attn_weights
 
         else:
             # 기존 VisionTransformer의 출력 형태 유지

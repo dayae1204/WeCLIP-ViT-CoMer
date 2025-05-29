@@ -84,30 +84,18 @@ class SegFormerHead(nn.Module):
     SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers
     - 수정: MLP 레이어 제거하고 단일 1x1 conv만 사용
     """
-    def __init__(self, in_channels=128, embedding_dim=256, num_classes=20, index=11, **kwargs):
-        super(SegFormerHead, self).__init__()
+    def __init__(self, in_channels=768, embedding_dim=256, num_classes=81):
+        super().__init__()
         self.in_channels = in_channels
+        self.embedding_dim = embedding_dim
         self.num_classes = num_classes
         
-        # CTI outputs는 8개 (4 stage * 2 branches)
-        self.num_cti_outputs = 8
+        # 1x1 convolution으로 채널 수 조정 (768 -> 256)
+        self.linear_fuse = nn.Conv2d(in_channels, embedding_dim, kernel_size=1)
+        self.dropout = nn.Dropout(0.1)
         
-        # 단순화: MLP 레이어들 제거하고 단일 1x1 conv만 사용
-        self.linear_fuse = nn.Conv2d(768 * self.num_cti_outputs, embedding_dim, kernel_size=1)
-        self.dropout = nn.Dropout2d(0.1)
-        
-    def forward(self, x_all):
-        """
-        x_all: CTI outputs 리스트 [N, 768, H/16, W/16] 형태의 텐서들 (8개)
-        return: 256 채널로 변환된 feature map [N, 256, H/16, W/16]
-        """
-        # CTI outputs를 채널 방향으로 concatenate
-        x_list = []
-        for x in x_all:
-            x_list.append(x)
-        x = torch.cat(x_list, dim=1)
-        
-        # 1x1 conv로 채널 수 조정
-        x = self.linear_fuse(x)
+    def forward(self, x):
+        # x: [B, 768, H, W]
+        x = self.linear_fuse(x)  # [B, 256, H, W]
         x = self.dropout(x)
         return x

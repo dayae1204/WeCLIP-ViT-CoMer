@@ -63,7 +63,8 @@ class WeCLIP(nn.Module):
         self.encoder = self.encoder.float()
         self.in_channels = in_channels
         
-        self.decoder_fts_fuse = SegFormerHead(in_channels=self.in_channels,embedding_dim=self.embedding_dim,
+        # VisionTransformer의 final_conv 출력이 768 채널이므로, 이를 SegFormerHead의 입력으로 사용
+        self.decoder_fts_fuse = SegFormerHead(in_channels=768, embedding_dim=self.embedding_dim,
                                                num_classes=self.num_classes)
         self.decoder = DecoderTransformer(width=self.embedding_dim, layers=3, heads=8, output_dim=self.num_classes)
 
@@ -147,17 +148,17 @@ class WeCLIP(nn.Module):
         self.iter_num += 1
 
         # CLIP + ViT-CoMer encoder forward
-        last_transformer_output, transformer_features, multi_level_features, cti_outputs, attn_weight_list = self.encoder.visual(
+        last_transformer_output, transformer_features, final_features, cti_outputs, attn_weight_list = self.encoder.visual(
             img, h, w, require_all_fts=self.require_all_fts)
-        
+
         # attention weight 처리
         attn_weight_stack = torch.stack(attn_weight_list, dim=0).permute(1, 0, 2, 3)
         
         # Input for Grad-CAM
         cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)  # (b, hw, 1, c)
         
-        # cti_outputs를 decoder_fts_fuse에 전달
-        fts = self.decoder_fts_fuse(cti_outputs)
+        # concatenated features를 decoder_fts_fuse에 전달
+        fts = self.decoder_fts_fuse(final_features)
         
         # decoder에 변환된 feature map 전달
         seg, seg_attn_weight_list = self.decoder(fts)
