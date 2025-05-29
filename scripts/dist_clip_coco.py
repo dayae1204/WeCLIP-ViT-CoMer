@@ -1,5 +1,5 @@
-# import sys
-# sys.path.insert(0, "/content/drive/MyDrive/kmong/WeCLIP+ViT_CoMer/WeCLIP")
+import sys
+sys.path.insert(0, "/content/drive/MyDrive/kmong/WeCLIP+ViT_CoMer/WeCLIP")
 
 from datasets.coco import CocoClsDataset
 import argparse
@@ -35,9 +35,91 @@ parser.add_argument("--seg_detach", action="store_true", help="detach seg")
 parser.add_argument("--work_dir", default=None, type=str, help="work_dir")
 parser.add_argument("--radius", default=8, type=int, help="radius")
 parser.add_argument("--crop_size", default=320, type=int, help="crop_size")
+parser.add_argument("--debug", action="store_true", help="enable gradient debugging")
 
+# 간단한 gradient 체크 함수 추가
+def check_gradients(model, n_iter, debug_mode=False):
+    """정확한 gradient 체크 함수 - 실제 모델 구조 기반"""
+    if not debug_mode and n_iter % 100 != 0:
+        return True
+        
+    learnable_count = 0
+    gradient_count = 0
+    module_stats = {}
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            learnable_count += 1
+            
+            # 정확한 모듈별 분류 (실제 코드 구조 기반)
+            if 'visual.spm' in name:
+                module_name = 'CNN_backbone'
+            elif 'visual.mrfp_modules' in name:
+                module_name = 'MRFP'
+            elif 'visual.interactions' in name:
+                if 'cti_tov' in name:  # CTI_toV 내부 파라미터
+                    module_name = 'CTI_toV'
+                elif 'cti_toc' in name:  # CTI_toC 내부 파라미터
+                    module_name = 'CTI_toC'
+                elif 'cfinter' in name:  # MultiscaleExtractor 내부
+                    module_name = 'CTI_Block'
+                elif 'mrfp' in name:  # CTIBlock 내부의 MRFP
+                    module_name = 'CTI_Block'
+                elif 'extra_CTIs' in name:  # Extra CTI modules
+                    module_name = 'CTI_Block'
+                else:
+                    module_name = 'CTI_Block'
+            elif 'visual.adapters_to_c' in name:
+                module_name = 'Adapters'
+            elif 'visual.level_embed' in name:
+                module_name = 'Level_Embed'
+            elif 'visual.mrfp_weights' in name:
+                module_name = 'MRFP_Weights'
+            elif 'visual.norm' in name:  # norm1, norm2, norm3, norm4
+                module_name = 'Norm_Layers'
+            elif 'visual.up' in name:  # 업샘플링 레이어
+                module_name = 'Upsampling'
+            elif 'visual.final_conv' in name:  # 최종 convolution
+                module_name = 'Final_Conv'
+            elif 'decoder.' in name and 'decoder_fts_fuse' not in name:
+                module_name = 'Decoder'
+            elif 'decoder_fts_fuse' in name:
+                module_name = 'SegFormerHead'
+            elif 'visual.transformer' in name:  # ViT transformer blocks
+                module_name = 'ViT_Transformer'
+            elif 'visual.' in name:  # 기타 visual 모듈
+                module_name = 'Visual_Other'
+            else:
+                module_name = 'Other'
+            
+            if module_name not in module_stats:
+                module_stats[module_name] = {'total': 0, 'with_grad': 0, 'grad_norm': 0.0}
+            
+            module_stats[module_name]['total'] += 1
+            
+            if param.grad is not None and param.grad.norm() > 1e-8:
+                gradient_count += 1
+                module_stats[module_name]['with_grad'] += 1
+                module_stats[module_name]['grad_norm'] += param.grad.norm().item()
 
-
+    coverage = gradient_count / learnable_count * 100 if learnable_count > 0 else 0
+    
+    if debug_mode or coverage < 50:  # 문제가 있거나 debug 모드일 때만 상세 출력
+        print(f"\n=== Gradient Check Iter {n_iter} ===")
+        print(f"Gradient coverage: {gradient_count}/{learnable_count} ({coverage:.1f}%)")
+        
+        for module_name, stats in module_stats.items():
+            if stats['total'] > 0:
+                coverage = stats['with_grad'] / stats['total'] * 100
+                avg_norm = stats['grad_norm'] / max(stats['with_grad'], 1)
+                print(f"{module_name}: {stats['with_grad']}/{stats['total']} ({coverage:.1f}%) avg_norm={avg_norm:.6f}")
+        
+        if coverage < 50:
+            print("⚠️  WARNING: Low gradient coverage!")
+            return False
+    
+    return True
+    
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -270,6 +352,11 @@ def train(cfg):
 
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient 체크 (처음 5번과 debug 모드에서는 항상, 나머지는 100번마다)
+        debug_mode = args.debug and (n_iter < 5 or n_iter % 1000 == 0)
+        check_gradients(WeCLIP_model, n_iter, debug_mode)
+      
         optimizer.step()
         
         if (n_iter + 1) % cfg.train.log_iters == 0:
