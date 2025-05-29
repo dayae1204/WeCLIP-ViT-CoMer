@@ -82,47 +82,32 @@ class Conv_Linear(nn.Module):
 class SegFormerHead(nn.Module):
     """
     SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers
-    - 수정: 단일 텐서(extra_cti_vit)도 처리할 수 있도록 변경
+    - 수정: MLP 레이어 제거하고 단일 1x1 conv만 사용
     """
     def __init__(self, in_channels=128, embedding_dim=256, num_classes=20, index=11, **kwargs):
         super(SegFormerHead, self).__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
-        self.indexes = index #6 #11
         
-        c1_in_channels, c2_in_channels, c3_in_channels, c4_in_channels = self.in_channels
+        # CTI outputs는 8개 (4 stage * 2 branches)
+        self.num_cti_outputs = 8
         
-        # 기존 코드 유지
-        linear_layers = [MLP(input_dim=c1_in_channels, embed_dim=embedding_dim) for i in range(self.indexes)]
-        self.linears_modulelist = nn.ModuleList(linear_layers)
-        
-        self.linear_fuse = nn.Conv2d(embedding_dim*self.indexes, embedding_dim, kernel_size=1)
-        
-        # 추가: 단일 텐서(extra_cti_vit)를 처리하기 위한 1x1 convolution
-        self.cti_reducer = nn.Conv2d(768, embedding_dim, kernel_size=1)
-        
+        # 단순화: MLP 레이어들 제거하고 단일 1x1 conv만 사용
+        self.linear_fuse = nn.Conv2d(768 * self.num_cti_outputs, embedding_dim, kernel_size=1)
         self.dropout = nn.Dropout2d(0.1)
         
     def forward(self, x_all):
-        # Extra_CTI outputs 처리
-        if isinstance(x_all, list) and len(x_all) == 8:  # CTI outputs list
-            # Stage 3의 ViT output (index 6) 추출
-            extra_cti_vit = x_all[6]  # Stage 3의 ViT output
-            
-            # Extra_CTI의 ViT output을 self.cti_reducer에 입력
-            x = self.cti_reducer(extra_cti_vit)
-            x = self.dropout(x)
-            return x
-        
-        # 기존 처리 방식 (여러 레이어의 특징을 처리)
+        """
+        x_all: CTI outputs 리스트 [N, 768, H/16, W/16] 형태의 텐서들 (8개)
+        return: 256 채널로 변환된 feature map [N, 256, H/16, W/16]
+        """
+        # CTI outputs를 채널 방향으로 concatenate
         x_list = []
-        for ind in range(x_all.shape[0]):
-            x = x_all[ind,:, :, :, :]
-            n, _, h, w = x.shape
-            _x = self.linears_modulelist[ind](x.float()).permute(0,2,1).reshape(n, -1, x.shape[2], x.shape[3])
-            x_list.append(_x)
-        x_list = torch.cat(x_list, dim=1)
-        x = self.linear_fuse(x_list)
-        x = self.dropout(x)
+        for x in x_all:
+            x_list.append(x)
+        x = torch.cat(x_list, dim=1)
         
+        # 1x1 conv로 채널 수 조정
+        x = self.linear_fuse(x)
+        x = self.dropout(x)
         return x
