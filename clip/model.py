@@ -847,17 +847,7 @@ def build_model(state_dict: dict):
         # 기존 WeCLIP transformer blocks는 freeze
         for name, param in model.visual.transformer.named_parameters():
             param.requires_grad = False
-        
-        # query_norm, positional embeddings freeze (특정 모듈만)
-        if hasattr(model.visual, 'query_norm'):
-            model.visual.query_norm.requires_grad = False
-        
-        # text encoder의 positional embedding은 freeze
-        model.positional_embedding.requires_grad = False
-        
-        # vision encoder의 positional embedding은 freeze
-        model.visual.positional_embedding.requires_grad = False
-        
+            
         # ViT-CoMer 관련 모듈은 학습 가능하게 설정
         learnable_modules = [
             model.visual.spm,  # CNN backbone
