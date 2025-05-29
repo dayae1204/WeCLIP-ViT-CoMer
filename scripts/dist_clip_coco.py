@@ -47,6 +47,44 @@ def check_gradients(model, n_iter, debug_mode=False):
     gradient_count = 0
     module_stats = {}
     
+    # 특정 파라미터들의 gradient 체크
+    print("\nChecking specific parameters' gradients:")
+    
+    # 모델 구조 출력 (처음 한 번만)
+    if n_iter == 0:
+        print("\nModel structure:")
+        for name, _ in model.named_modules():
+            print(f"- {name}")
+    
+    # query_norm 체크 (여러 가능한 위치)
+    query_norm_found = False
+    for name, module in model.named_modules():
+        if 'query_norm' in name:
+            query_norm_found = True
+            grad = module.weight.grad if hasattr(module, 'weight') else None
+            if grad is not None:
+                print(f"{name} gradient norm: {grad.norm().item():.6f}")
+            else:
+                print(f"{name} gradient is None")
+    
+    if not query_norm_found:
+        print("query_norm not found in model")
+    
+    # text encoder positional embedding 체크
+    grad = model.encoder.positional_embedding.grad
+    if grad is not None:
+        print(f"text encoder positional_embedding gradient norm: {grad.norm().item():.6f}")
+    else:
+        print("text encoder positional_embedding gradient is None")
+    
+    # vision encoder positional embedding 체크
+    grad = model.encoder.visual.positional_embedding.grad
+    if grad is not None:
+        print(f"vision encoder positional_embedding gradient norm: {grad.norm().item():.6f}")
+    else:
+        print("vision encoder positional_embedding gradient is None")
+    
+    # 기존의 전체 gradient 체크 로직
     for name, param in model.named_parameters():
         if param.requires_grad:
             learnable_count += 1

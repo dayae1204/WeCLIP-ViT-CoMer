@@ -848,6 +848,11 @@ def build_model(state_dict: dict):
         for name, param in model.visual.transformer.named_parameters():
             param.requires_grad = False
         
+        # query_norm, positional embeddings freeze
+        model.visual.query_norm.requires_grad = False
+        model.positional_embedding.requires_grad = False
+        model.visual.positional_embedding.requires_grad = False
+        
         # ViT-CoMer 관련 모듈은 학습 가능하게 설정
         learnable_modules = [
             model.visual.spm,  # CNN backbone
@@ -910,10 +915,24 @@ def save_learnable_weights(model, path):
             if param.requires_grad:
                 state_dict[f'visual.norm{i}.{name}'] = param
     
+    # Level embedding - 새로 추가된 모듈
+    if model.visual.level_embed.requires_grad:
+        state_dict['visual.level_embed'] = model.visual.level_embed
+    
+    # MRFP weights - 새로 추가된 모듈
+    for i, weight in enumerate(model.visual.mrfp_weights):
+        if weight.requires_grad:
+            state_dict[f'visual.mrfp_weights.{i}'] = weight
+    
     # 저장할 파라미터 수 출력
     total_params = sum(p.numel() for p in state_dict.values())
     print(f"Saving {len(state_dict)} learnable parameters (ViT-CoMer modules only)")
     print(f"Total number of learnable parameters: {total_params:,}")
+    
+    # 저장 전에 state_dict의 키들을 출력하여 확인
+    print("\nSaving the following modules:")
+    for key in state_dict.keys():
+        print(f"- {key}")
     
     torch.save(state_dict, path)
 
