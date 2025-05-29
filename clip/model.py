@@ -364,7 +364,7 @@ class VisionTransformer(nn.Module):
         # CTIBlock 모듈들 - 원래 ViT-CoMer의 CTIBlock 사용
         self.interactions = nn.ModuleList([
             CTIBlock(dim=width, num_heads=heads//2, n_points=4,
-                    init_values=0., drop_path=0.1,
+                    init_values=0.1, drop_path=0.1,
                     norm_layer=LayerNorm, with_cffn=True,
                     cffn_ratio=0.25, deform_ratio=1.0,
                     use_CTI_toV=True, use_CTI_toC=True,
@@ -469,7 +469,7 @@ class VisionTransformer(nn.Module):
 
         # 각 stage 별로 원래 CTIBlock 사용
         for stage_idx, (start_block, end_block) in enumerate(self.stage_indices):
-            print(f"Stage {stage_idx}: ViT shape {current_vit.shape}, CNN shape {current_cnn.shape}")
+            # print(f"Stage {stage_idx}: ViT shape {current_vit.shape}, CNN shape {current_cnn.shape}")
             
             # # 클래스 토큰 제거는 첫 번째 stage에서만 -> comer_moudles에서 처리
             # if stage_idx == 0:
@@ -514,7 +514,7 @@ class VisionTransformer(nn.Module):
             cti_outputs.append(vit_spatial)  # ViT branch용 CTI 출력
             cti_outputs.append(cnn_spatial)  # CNN branch용 CTI 출력
             
-            print(f"Stage {stage_idx} completed successfully")
+            # print(f"Stage {stage_idx} completed successfully")
         
         # CNN feature 분리 및 reshape
         c2_len = c2.size(1)
