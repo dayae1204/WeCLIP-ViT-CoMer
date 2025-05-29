@@ -141,10 +141,10 @@ class WeCLIP(nn.Module):
         if self.encoder.visual.level_embed.requires_grad:
             param_groups[4].append(self.encoder.visual.level_embed)
         
-        # MRFP weights 파라미터 - learnable
-        for weight in self.encoder.visual.mrfp_weights:
-            if weight.requires_grad:
-                param_groups[4].append(weight)
+        # # MRFP weights 파라미터 - learnable
+        # for weight in self.encoder.visual.mrfp_weights:
+        #     if weight.requires_grad:
+        #         param_groups[4].append(weight)
                 
         return param_groups
         

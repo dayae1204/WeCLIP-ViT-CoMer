@@ -381,10 +381,10 @@ class VisionTransformer(nn.Module):
         # 8개의 CTI 출력을 channel-wise concat 후 적용할 1x1 convolution
         self.final_conv = nn.Conv2d(width * 4, width, kernel_size=1)  # 4개의 feature map을 concat하므로 width * 4
 
-        # MRFP 결과를 CNN feature에 통합하기 위한 learnable weights
-        self.mrfp_weights = nn.ParameterList([
-            nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
-        ])
+        # # MRFP 결과를 CNN feature에 통합하기 위한 learnable weights
+        # self.mrfp_weights = nn.ParameterList([
+        #     nn.Parameter(torch.ones(1)) for _ in range(len(self.stage_indices))
+        # ])
 
     def _init_weights_fn(self, m):
         if isinstance(m, nn.Linear):
@@ -848,9 +848,14 @@ def build_model(state_dict: dict):
         for name, param in model.visual.transformer.named_parameters():
             param.requires_grad = False
         
-        # query_norm, positional embeddings freeze
-        model.visual.query_norm.requires_grad = False
+        # query_norm, positional embeddings freeze (특정 모듈만)
+        if hasattr(model.visual, 'query_norm'):
+            model.visual.query_norm.requires_grad = False
+        
+        # text encoder의 positional embedding은 freeze
         model.positional_embedding.requires_grad = False
+        
+        # vision encoder의 positional embedding은 freeze
         model.visual.positional_embedding.requires_grad = False
         
         # ViT-CoMer 관련 모듈은 학습 가능하게 설정
@@ -872,8 +877,8 @@ def build_model(state_dict: dict):
         
         # nn.Parameter 객체들은 별도로 처리
         model.visual.level_embed.requires_grad = True  # Level embedding
-        for weight in model.visual.mrfp_weights:  # MRFP weights
-            weight.requires_grad = True
+        # for weight in model.visual.mrfp_weights:  # MRFP weights
+        #     weight.requires_grad = True
     
     return model.eval()
 

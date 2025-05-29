@@ -50,11 +50,11 @@ def check_gradients(model, n_iter, debug_mode=False):
     # 특정 파라미터들의 gradient 체크
     print("\nChecking specific parameters' gradients:")
     
-    # 모델 구조 출력 (처음 한 번만)
-    if n_iter == 0:
-        print("\nModel structure:")
-        for name, _ in model.named_modules():
-            print(f"- {name}")
+    # # 모델 구조 출력 (처음 한 번만)
+    # if n_iter == 0:
+    #     print("\nModel structure:")
+    #     for name, _ in model.named_modules():
+    #         print(f"- {name}")
     
     # query_norm 체크 (여러 가능한 위치)
     query_norm_found = False
