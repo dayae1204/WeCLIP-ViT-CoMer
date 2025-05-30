@@ -385,6 +385,10 @@ class CTI_toV(nn.Module):
        
     
     def forward(self, query, reference_points, feat, spatial_shapes, level_start_index, H, W):
+        # 🔍 디버깅: MSDeformAttn 입력 체크
+        print(f"🔍 MSDeformAttn query grad_fn: {query.grad_fn}")
+        print(f"🔍 MSDeformAttn reference_points grad_fn: {reference_points.grad_fn}")
+        print(f"🔍 MSDeformAttn feat grad_fn: {feat.grad_fn}")
         
         def _inner_forward(query, feat, H, W):
             B, N, C = feat.shape
@@ -392,6 +396,10 @@ class CTI_toV(nn.Module):
                              self.feat_norm(feat), spatial_shapes,
                              level_start_index, None)
 
+            # 🔍 디버깅: MSDeformAttn 출력 체크
+            print(f"🔍 MSDeformAttn output c1 grad_fn: {c1.grad_fn}")
+            print(f"🔍 MSDeformAttn output c1 requires_grad: {c1.requires_grad}")
+            
             c1 = c1 + self.drop_path(self.ffn(self.ffn_norm(c1), H, W)) 
 
             c_select1, c_select2, c_select3 = c1[:,:H*W*4, :], c1[:, H*W*4:H*W*4+H*W, :], c1[:, H*W*4+H*W:, :]
@@ -449,15 +457,25 @@ class CTIBlock(nn.Module):
     def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
         B, N, C = x.shape
 
+        # 🔍 디버깅: CTI 입력 체크
+        print(f"🔍 CTI input x grad_fn: {x.grad_fn}")
+        print(f"🔍 CTI input x requires_grad: {x.requires_grad}")
+
         # class token 저장 (permute된 상태에서 처리)
         cls_token = x[:, 0:1, :]  # [B, 1, C]
         x = x[:, 1:, :]  # class token 제거 [B, N-1, C]
 
         deform_inputs = deform_inputs_only_one(x, H*16, W*16)
         
+        # 🔍 디버깅: deform_inputs 체크
+        print(f"🔍 deform reference_points grad_fn: {deform_inputs[0].grad_fn}")
+        print(f"🔍 deform reference_points requires_grad: {deform_inputs[0].requires_grad}")
+        
         if self.use_CTI_toV:
+            # CTI_toV 처리 전후 체크
+            print(f"🔍 Before CTI_toV x grad_fn: {x.grad_fn}")
+            
             c = self.mrfp(c, H, W)
-            # c_select2의 크기가 x와 일치하는지 확인
             c_select1 = c[:, :H*W*4, :]
             c_select2 = c[:, H*W*4:H*W*4+H*W, :]
             c_select3 = c[:, H*W*4+H*W:, :]
@@ -467,7 +485,9 @@ class CTIBlock(nn.Module):
             x = self.cti_tov(query=x, reference_points=deform_inputs[0],
                           feat=c, spatial_shapes=deform_inputs[1],
                           level_start_index=deform_inputs[2], H=H, W=W)
-
+            
+            print(f"🔍 After CTI_toV x grad_fn: {x.grad_fn}")
+        
         collected_attn_weights = []
         last_transformer_output = None
         x, cls_token = x.permute(1, 0, 2), cls_token.permute(1, 0, 2)  # (L, N, D)

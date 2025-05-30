@@ -152,6 +152,10 @@ class WeCLIP(nn.Module):
         # 이미지를 float으로 변환
         img = img.float()
         
+        # 🔍 디버깅: input 체크
+        print(f"🔍 Input img requires_grad: {img.requires_grad}")
+        print(f"🔍 positional_embedding requires_grad: {self.encoder.visual.positional_embedding.requires_grad}")
+        
         cam_list = []
         b, c, h, w = img.shape
         self.iter_num += 1
@@ -165,12 +169,25 @@ class WeCLIP(nn.Module):
         
         # Input for Grad-CAM
         cam_fts_all = last_transformer_output.unsqueeze(0).permute(2, 1, 0, 3)  # (b, hw, 1, c)
-        
+
+         # 🔍 디버깅: encoder 출력 체크
+        print(f"🔍 last_transformer_output grad_fn: {last_transformer_output.grad_fn}")
+        print(f"🔍 final_features grad_fn: {final_features.grad_fn}")
+        print(f"🔍 final_features requires_grad: {final_features.requires_grad}")
+               
         # concatenated features를 decoder_fts_fuse에 전달
         fts = self.decoder_fts_fuse(final_features)
         
+        # 🔍 디버깅: decoder_fts_fuse 출력 체크
+        print(f"🔍 fts grad_fn: {fts.grad_fn}")
+        print(f"🔍 fts requires_grad: {fts.requires_grad}")
+        
         # decoder에 변환된 feature map 전달
         seg, seg_attn_weight_list = self.decoder(fts)
+        
+        # 🔍 디버깅: 최종 출력 체크
+        print(f"🔍 seg grad_fn: {seg.grad_fn}")
+        print(f"🔍 seg requires_grad: {seg.requires_grad}")
         
         # Generate affinity map
         attn_fts = fts.clone()  # 256 channel
@@ -187,6 +204,10 @@ class WeCLIP(nn.Module):
             img_i = img[i]
             cam_fts = cam_fts_all[i]
             cam_attn = attn_weight_stack[i]
+
+            # cam_fts = last_transformer_output[i]
+            # cam_attn = attn_weight_list[i]
+
             seg_attn = attn_pred.unsqueeze(0)[:, i, :, :]
 
             if self.iter_num > 40000 or mode=='val':

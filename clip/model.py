@@ -430,6 +430,10 @@ class VisionTransformer(nn.Module):
         return pos_embed
     
     def forward(self, x: torch.Tensor, H, W, require_all_fts=False):
+        # 🔍 디버깅: positional embedding 체크
+        print(f"🔍 positional_embedding grad_fn: {self.positional_embedding.grad_fn}")
+        print(f"🔍 positional_embedding requires_grad: {self.positional_embedding.requires_grad}")
+        
         # deform_inputs 준비
         deform_inputs1, deform_inputs2 = deform_inputs(x)
         
@@ -440,14 +444,23 @@ class VisionTransformer(nn.Module):
         
         # ViT branch 초기화 - WeCLIP 방식
         self.positional_embedding_new = upsample_pos_emb(self.positional_embedding, (H//16, W//16))
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        
+        # 🔍 디버깅: upsample 후 체크
+        print(f"🔍 positional_embedding_new grad_fn: {self.positional_embedding_new.grad_fn}")
+        print(f"🔍 positional_embedding_new requires_grad: {self.positional_embedding_new.requires_grad}")
+        
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         x = x + self.positional_embedding_new.to(x.dtype)
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # NLD -> LND
 
+        # 🔍 디버깅: positional embedding 더한 후 체크
+        print(f"🔍 x after adding pos_emb grad_fn: {x.grad_fn}")
+        print(f"🔍 x after adding pos_emb requires_grad: {x.requires_grad}")
+        
         bs, _, dim = x.shape[1], x.shape[0], x.shape[2]
         
         # attention weight를 저장할 리스트와 transformer feature map을 저장할 리스트
