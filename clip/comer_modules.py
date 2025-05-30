@@ -46,19 +46,64 @@ def deform_inputs(x):
     return deform_inputs1, deform_inputs2
 
 
-def deform_inputs_only_one(x, h, w):
-    # bs, c, h, w = x.shape
-    spatial_shapes = torch.as_tensor([(h // 8, w // 8),
-                                      (h // 16, w // 16),
-                                      (h // 32, w // 32)],
-                                     dtype=torch.long, device=x.device)
-    level_start_index = torch.cat((spatial_shapes.new_zeros(
-        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-    reference_points = get_reference_points([(h // 8, w // 8),
-                                      (h // 16, w // 16),
-                                      (h // 32, w // 32)], device=x.device)
-    deform_inputs = [reference_points, spatial_shapes, level_start_index]
+# def deform_inputs_only_one(x, h, w):
+#     # bs, c, h, w = x.shape
+#     spatial_shapes = torch.as_tensor([(h // 8, w // 8),
+#                                       (h // 16, w // 16),
+#                                       (h // 32, w // 32)],
+#                                      dtype=torch.long, device=x.device)
+#     level_start_index = torch.cat((spatial_shapes.new_zeros(
+#         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+#     reference_points = get_reference_points([(h // 8, w // 8),
+#                                       (h // 16, w // 16),
+#                                       (h // 32, w // 32)], device=x.device)
+#     deform_inputs = [reference_points, spatial_shapes, level_start_index]
     
+#     return deform_inputs
+
+def get_reference_points(spatial_shapes, device, dtype=torch.float32):
+    """Gradient-friendly reference points 생성"""
+    reference_points_list = []
+    for lvl, (H_, W_) in enumerate(spatial_shapes):
+        # ⭐ torch.linspace 대신 gradient-friendly한 방법 사용
+        ref_y = torch.arange(0.5, H_, device=device, dtype=dtype).view(-1, 1).expand(-1, W_).reshape(-1) / H_
+        ref_x = torch.arange(0.5, W_, device=device, dtype=dtype).view(1, -1).expand(H_, -1).reshape(-1) / W_
+        ref = torch.stack((ref_x, ref_y), -1)
+        reference_points_list.append(ref)
+    reference_points = torch.cat(reference_points_list, 0)
+    reference_points = reference_points.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
+    return reference_points
+
+def create_spatial_shapes_tensor(shapes_list, device, dtype=torch.long):
+    """Gradient-friendly spatial shapes tensor 생성"""
+    # ⭐ torch.as_tensor 대신 torch.tensor 사용 (새로운 tensor이지만 명시적)
+    return torch.tensor(shapes_list, device=device, dtype=dtype, requires_grad=False)
+
+def create_level_start_index(spatial_shapes):
+    """Gradient-friendly level start index 생성"""
+    # ⭐ spatial_shapes.new_zeros 대신 explicit tensor creation
+    zeros = torch.zeros(1, device=spatial_shapes.device, dtype=spatial_shapes.dtype)
+    prod_cumsum = spatial_shapes.prod(1).cumsum(0)[:-1]
+    return torch.cat([zeros, prod_cumsum])
+
+def deform_inputs_only_one(x, h, w):
+    """핵심 수정: Gradient-friendly deform inputs 생성"""
+    
+    # ⭐ torch.as_tensor 완전 제거하고 gradient-friendly 방법 사용
+    spatial_shapes = create_spatial_shapes_tensor(
+        [(h // 8, w // 8), (h // 16, w // 16), (h // 32, w // 32)],
+        x.device, torch.long
+    )
+    
+    level_start_index = create_level_start_index(spatial_shapes)
+    
+    # ⭐ Reference points도 gradient-friendly하게 생성
+    reference_points = get_reference_points(
+        [(h // 8, w // 8), (h // 16, w // 16), (h // 32, w // 32)], 
+        x.device, x.dtype
+    )
+    
+    deform_inputs = [reference_points, spatial_shapes, level_start_index]
     return deform_inputs
 
 class ConvFFN(nn.Module):
